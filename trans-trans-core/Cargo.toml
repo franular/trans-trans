@@ -1,0 +1,11 @@
+[package]
+name = "trans-trans-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = "1.25.0"
+embedded-io = "0.7.1"
+heapless = "0.9.2"
+log = "0.4.29"
+serde = { version = "1.0.228", features = ["serde_derive"] }
