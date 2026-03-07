@@ -280,7 +280,7 @@ impl Dialog for CpalConfigDialog {
 
 #[derive(Default)]
 struct Throbber {
-    tick: i32,
+    high: bool,
 }
 
 #[derive(Default)]
@@ -343,11 +343,13 @@ impl App {
         audio_tx: std::sync::mpsc::Sender<audio::Cmd>,
     ) -> Self {
         let bytes0 = std::fs::read("kits/Small Faces - Rollin Over.ttk").unwrap();
-        let bytes1 = std::fs::read("kits/luau.ttk").unwrap();
+        let bytes1 = std::fs::read("kits/face a.ttk").unwrap();
         let bytes2 = std::fs::read("kits/Dennis Coffey - Scorpio (cd).ttk").unwrap();
-        let bytes3 = std::fs::read("kits/Funk Brothers - I Can't Get Next To You.ttk").unwrap();
+        let bytes3 = std::fs::read("kits/James Brown - Cold Sweat (ver.2).ttk").unwrap();
         let mut state_handler = ttcore::state::StateHandler::new();
         // FIXME: remove dev defaults
+        state_handler.set_record_start_snap(ttcore::state::Snap::Onset);
+        state_handler.set_record_len_snap(ttcore::state::Snap::Beat);
         state_handler.kits = [
             Some(serde_json::from_slice::<ttcore::state::Kit>(&bytes0).unwrap()),
             Some(serde_json::from_slice::<ttcore::state::Kit>(&bytes1).unwrap()),
@@ -377,13 +379,13 @@ impl App {
         }
     }
 
-    pub fn run(mut self, mut terminal: ratatui::DefaultTerminal, mut input_rx: futures::channel::mpsc::UnboundedReceiver<Cmd>) -> Result<()> {
+    pub fn run(mut self, mut terminal: ratatui::DefaultTerminal, mut input_rx: futures::channel::mpsc::UnboundedReceiver<Cmd>, mut midi_out: midir::MidiOutputConnection) -> Result<()> {
         let mut event_stream = crossterm::event::EventStream::new();
         while !self.quit {
             terminal.draw(|frame| {
                 frame.render_widget(&self, frame.area());
             })?;
-            self.handle_events(&mut event_stream, &mut input_rx)?;
+            self.handle_events(&mut event_stream, &mut input_rx, &mut midi_out)?;
         }
         Ok(())
     }
@@ -484,7 +486,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_events(&mut self, event_stream: &mut crossterm::event::EventStream, input_rx: &mut futures::channel::mpsc::UnboundedReceiver<Cmd>) -> Result<()> {
+    fn handle_events(&mut self, event_stream: &mut crossterm::event::EventStream, input_rx: &mut futures::channel::mpsc::UnboundedReceiver<Cmd>, midi_out: &mut midir::MidiOutputConnection) -> Result<()> {
         let maybe_timeout = match [self.dialog.timeout()]
             .into_iter()
             .enumerate()
@@ -557,10 +559,10 @@ impl App {
                         release!('p') => self.push_speed(3, false)?,
                         // active phrase
                         repeat!(-Delete) => self.state_handler.mod_active_phrase_start(-((self.num_buffer.get_num(1)) as i32), self.num_buffer.snap),
-                        press!(-End) => self.state_handler.set_active_phrase_start(self.num_buffer.get_num(1)),
+                        press!(-End) => self.state_handler.set_active_phrase_start(self.num_buffer.get_num(1), self.num_buffer.snap),
                         repeat!(-PageDown) => self.state_handler.mod_active_phrase_start((self.num_buffer.get_num(1)) as i32, self.num_buffer.snap),
                         repeat!(-Insert) => self.state_handler.mod_active_phrase_len(-((self.num_buffer.get_num(1)) as i32), self.num_buffer.snap),
-                        press!(-Home) => self.state_handler.set_active_phrase_len(self.num_buffer.get_num(1)),
+                        press!(-Home) => self.state_handler.set_active_phrase_len(self.num_buffer.get_num(1), self.num_buffer.snap),
                         repeat!(-PageUp) => self.state_handler.mod_active_phrase_len((self.num_buffer.get_num(1)) as i32, self.num_buffer.snap),
                         // record
                         press!(' ') => self.start_record()?,
@@ -580,13 +582,14 @@ impl App {
                         // snap
                         press!('f') => self.num_buffer.snap = ttcore::state::Snap::Tick,
                         press!('o') => self.num_buffer.snap = ttcore::state::Snap::Beat,
-                        press!('u') => self.num_buffer.snap = ttcore::state::Snap::Onset,
+                        press!('u') => self.num_buffer.snap = ttcore::state::Snap::Input,
                         press!('\'') => self.num_buffer.snap = ttcore::state::Snap::Onset,
                         press!('-') => self.state_handler.set_ramp_snap(self.num_buffer.snap),
                         press!('=') => self.state_handler.set_record_start_snap(self.num_buffer.snap),
                         press!('\\') => self.state_handler.set_record_len_snap(self.num_buffer.snap),
                         press!('[') => self.audio_tx.send(audio::Cmd::TicksPerBeat(self.num_buffer.get_num(1)))?,
                         press!(']') => self.audio_tx.send(audio::Cmd::TicksPerInput(self.num_buffer.get_num(1)))?,
+                        press!(-CapsLock) => self.audio_tx.send(audio::Cmd::Tempo(self.num_buffer.get_num(1) as f32))?,
                         // reverse
                         press!(+LeftShift) => self.push_state(ttcore::StateInput::Reverse(true))?,
                         release!(+LeftShift) => self.push_state(ttcore::StateInput::Reverse(false))?,
@@ -608,13 +611,14 @@ impl App {
             cmd = cmd_fut => {
                 match cmd? {
                     Cmd::Tick { tick, active_state, active_mod, ticks_per_beat, ticks_per_input } => {
-                        if self.state_handler.pass_input {
-                            self.throbber.tick += 1;
-                        }
+                        self.throbber.high = tick.rem_euclid(self.state_handler.ticks_per_beat as i32) < self.state_handler.ticks_per_beat as i32 / 4;
                         self.state_handler.ticks_per_beat = ticks_per_beat;
                         self.state_handler.ticks_per_input = ticks_per_input;
                         let state = self.state_handler.tick(tick, active_state, active_mod);
                         self.audio_tx.send(audio::Cmd::PushState(state))?;
+                        // midi clock
+                        let event = midly::live::SystemRealtime::TimingClock;
+                        midi_out.send(&[event.encode()])?;
                     }
                 }
                 Ok(())

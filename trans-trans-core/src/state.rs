@@ -658,7 +658,7 @@ where
                         self.mod_phrase_start(store_to, delta_start, self.phrase_writer.snap_start);
                         self.mod_phrase_len(store_to, delta_len, self.phrase_writer.snap_len);
                         let _ = self.push_phrase(PhraseInput::Push { index: store_to });
-                        self.buffer.speed = None;
+                        self.ramp.speed = 1.;
                     }
                 },
             }
@@ -693,7 +693,6 @@ where
             }
             if let Some(reverse) = self.buffer.reverse.take() { self.input_state.reverse = reverse }
             if let Some(speed) = self.buffer.speed.take() { self.input_state.speed = speed }
-            self.ramp.speed = 1.;
         }
         self.pass_input = pass_input;
         self.phrase_writer.push(active_mod);
@@ -717,15 +716,6 @@ where
         }
     }
 
-    /// quantized to input only
-    /// should be called before `StateHandler::tick`
-    pub fn set_active_phrase_start(&mut self, input: u32) {
-        if let Some(reader) = self.top_reader() {
-            let Phrase { start, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
-            *start = input * self.ticks_per_input;
-        }
-    }
-
     pub fn set_record_start_snap(&mut self, snap: Snap) {
         self.phrase_writer.snap_start = snap;
     }
@@ -738,12 +728,29 @@ where
         self.ramp.snap = snap;
     }
 
-    /// quantized to input only
     /// should be called before `StateHandler::tick`
-    pub fn set_active_phrase_len(&mut self, input: u32) {
+    pub fn set_active_phrase_start(&mut self, input: u32, snap: Snap) {
+        if let Some(reader) = self.top_reader() {
+            let Phrase { start, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
+            match snap {
+                Snap::Tick => *start = input,
+                Snap::Beat => *start = input * self.ticks_per_beat,
+                Snap::Input => *start = input * self.ticks_per_input,
+                Snap::Onset => (),
+            }
+        }
+    }
+
+    /// should be called before `StateHandler::tick`
+    pub fn set_active_phrase_len(&mut self, input: u32, snap: Snap) {
         if let Some(reader) = self.top_reader() {
             let Phrase { len, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
-            *len = input * self.ticks_per_input;
+            match snap {
+                Snap::Tick => *len = input,
+                Snap::Beat => *len = input * self.ticks_per_beat,
+                Snap::Input => *len = input * self.ticks_per_input,
+                Snap::Onset => (),
+            }
         }
     }
 
@@ -751,8 +758,8 @@ where
         let Phrase { states, start, .. } = self.phrases[index as usize].as_mut().unwrap();
         match snap {
             Snap::Tick => *start = (*start as i32 + delta).rem_euclid(PHRASE_LEN as i32) as u32,
-            Snap::Beat => *start = ((*start as i32 + delta * self.ticks_per_beat as i32) * self.ticks_per_beat as i32 / self.ticks_per_beat as i32).rem_euclid(PHRASE_LEN as i32) as u32,
-            Snap::Input => *start = ((*start as i32 + delta * self.ticks_per_input as i32) * self.ticks_per_input as i32 / self.ticks_per_input as i32).rem_euclid(PHRASE_LEN as i32) as u32,
+            Snap::Beat => *start = ((*start as i32 + delta * self.ticks_per_beat as i32) / self.ticks_per_beat as i32 * self.ticks_per_beat as i32).rem_euclid(PHRASE_LEN as i32) as u32,
+            Snap::Input => *start = ((*start as i32 + delta * self.ticks_per_input as i32) / self.ticks_per_input as i32 * self.ticks_per_input as i32).rem_euclid(PHRASE_LEN as i32) as u32,
             Snap::Onset => {
                 if delta == 0 { return; }
                 if delta.is_negative() && let Some((delta, _)) = states
@@ -794,11 +801,11 @@ where
                 if new > 0 { *len = new as u32 }
             }
             Snap::Beat => {
-                let new = (*len as i32 + delta * self.ticks_per_beat as i32) * self.ticks_per_beat as i32 / self.ticks_per_beat as i32;
+                let new = (*len as i32 + delta * self.ticks_per_beat as i32) / self.ticks_per_beat as i32 * self.ticks_per_beat as i32;
                 if new > 0 { *len = new as u32 }
             }
             Snap::Input => {
-                let new = (*len as i32 + delta * self.ticks_per_input as i32) * self.ticks_per_input as i32 / self.ticks_per_input as i32;
+                let new = (*len as i32 + delta * self.ticks_per_input as i32) / self.ticks_per_input as i32 * self.ticks_per_input as i32;
                 if new > 0 { *len = new as u32 }
             }
             Snap::Onset => {

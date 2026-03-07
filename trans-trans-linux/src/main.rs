@@ -2,6 +2,8 @@
 #![allow(clippy::precedence, clippy::new_without_default, clippy::too_many_arguments)]
 #![allow(incomplete_features, static_mut_refs)]
 
+use std::io::Write;
+
 use color_eyre::Result;
 
 mod audio;
@@ -20,6 +22,37 @@ fn main() -> Result<()> {
     let (audio_tx, audio_rx) = std::sync::mpsc::channel();
     let (input_tx, input_rx) = futures::channel::mpsc::unbounded();
 
+    let midi_out = midir::MidiOutput::new("trans-trans-midi-out")?;
+
+    // Get an output port (read from console if multiple are available)
+    let out_ports = midi_out.ports();
+    let out_port: &midir::MidiOutputPort = match out_ports.len() {
+        0 => panic!("no output port found"),
+        1 => {
+            println!(
+                "Choosing the only available output port: {}",
+                midi_out.port_name(&out_ports[0]).unwrap()
+            );
+            &out_ports[0]
+        }
+        _ => {
+            println!("\nAvailable output ports:");
+            for (i, p) in out_ports.iter().enumerate() {
+                println!("{}: {}", i, midi_out.port_name(p).unwrap());
+            }
+            print!("Please select output port: ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            out_ports
+                .get(input.trim().parse::<usize>()?)
+                .expect("invalid output port selected")
+        }
+    };
+    println!("\nOpening connection");
+    let mut conn_out = midi_out.connect(out_port, "trans-trans").unwrap();
+    println!("Connection open. Listen!");
+
     unsafe { audio::AUDIO_HANDLER.replace(audio::AudioHandler::new(audio_rx, input_tx)) };
     let app = input::App::new(audio_tx);
 
@@ -36,7 +69,7 @@ fn main() -> Result<()> {
         ),
     )?;
 
-    let app_result = app.run(terminal, input_rx);
+    let app_result = app.run(terminal, input_rx, conn_out);
     crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,

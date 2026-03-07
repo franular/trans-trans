@@ -75,10 +75,10 @@ impl Widget for &input::App {
 impl Widget for &input::Throbber {
     fn render(self, area: ratatui::prelude::Rect, buf: &mut ratatui::prelude::Buffer) {
         let throbber_area = area.centered_vertically(Constraint::Length(3)).centered_horizontally(Constraint::Length(6));
-        if self.tick.rem_euclid(2) == 0 {
-            ratatui::widgets::Block::new().style(BG).render(throbber_area, buf)
+        if self.high {
+            ratatui::widgets::Block::new().style(BG).render(throbber_area, buf);
         } else {
-            ratatui::widgets::Clear.render(throbber_area, buf)
+            ratatui::widgets::Clear.render(throbber_area, buf);
         }
     }
 }

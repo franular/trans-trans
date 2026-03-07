@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 bytemuck = "1.25.0"
 color-eyre = "0.6.5"
-cpal = "0.17.3"
+cpal = "0.17.1"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 embedded-io = "0.7.1"
 embedded-io-adapters = { version = "0.7.0", features = ["std"] }
@@ -20,3 +20,5 @@ serde = { version = "1.0.228", features = ["serde_derive"] }
 serde_json = "1.0.149"
 ttcore = { path = "../trans-trans-core", package = "trans-trans-core" }
 tinyrand = "0.5.0"
+midir = { version = "0.10.3", features = ["jack"] }
+midly = "0.5.3"

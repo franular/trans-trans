@@ -8,6 +8,7 @@ pub enum Cmd {
     PushState(ttcore::state::ModState<ttcore::state::OnsetEvent<ttcore::state::Onset>>),
     TicksPerBeat(u32),
     TicksPerInput(u32),
+    Tempo(f32),
 }
 
 pub struct AudioHandler {
@@ -27,7 +28,7 @@ impl AudioHandler {
         // FIXME: remove dev defaults
         signal_handler.ticks_per_beat = 16;
         signal_handler.ticks_per_input = 8;
-        signal_handler.tempo = 262.;
+        signal_handler.tempo = 192.;
         Self {
             audio_rx,
             input_tx,
@@ -51,6 +52,7 @@ impl AudioHandler {
                         Cmd::PushState(state) => last_state = state,
                         Cmd::TicksPerBeat(ticks_per_beat) => self.signal_handler.ticks_per_beat = ticks_per_beat,
                         Cmd::TicksPerInput(ticks_per_input) => self.signal_handler.ticks_per_input = ticks_per_input,
+                        Cmd::Tempo(tempo) => self.signal_handler.tempo = tempo,
                     }
                 }
                 let active_mod = last_state.as_unit();
