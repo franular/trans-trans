@@ -77,20 +77,26 @@ macro_rules! release {
     };
 }
 
-const SPEED_COUNT: usize = 4;
+const INIT_PHRASE_SNAP_START: ttcore::Snap = ttcore::Snap::Macro;
+const INIT_PHRASE_SNAP_LEN: ttcore::Snap = ttcore::Snap::Macro;
+const INIT_PITCH_INTERVAL: f32 = 1.0594631;
+const INIT_RAMP_SNAP: ttcore::Snap = ttcore::Snap::Macro;
+pub const INIT_TEMPO: f32 = 192.;
+pub const INIT_TICKS_PER_BEAT: u32 = 16;
+pub const INIT_TICKS_PER_INPUT: u32 = 4;
+pub const INIT_TICKS_PER_STEP: u32 = 16;
+pub const INIT_STEPS_PER_MEAS: u32 = 7;
+
+const BANK_COUNT: usize = 2;
+pub const LAYER_COUNT: usize = 2;
 const KIT_COUNT: usize = 4;
-pub const ONSET_COUNT: usize = 8;
+const KIT_LEN: usize = 8;
 const PHRASE_COUNT: usize = 8;
 const PHRASE_LEN: usize = 1024;
 
 pub enum Cmd {
-    Tick {
-        tick: i32,
-        active_state: ttcore::state::State<()>,
-        active_mod: ttcore::state::ModState<ttcore::state::OnsetEvent<()>>,
-        ticks_per_beat: u32,
-        ticks_per_input: u32,
-    },
+    Tick(ttcore::signal::Message<LAYER_COUNT>),
+    Midi(midly::MidiMessage),
 }
 
 #[derive(Copy, Clone)]
@@ -280,6 +286,7 @@ impl Dialog for CpalConfigDialog {
 
 #[derive(Default)]
 struct Throbber {
+    step: i32,
     high: bool,
 }
 
@@ -287,23 +294,21 @@ struct Throbber {
 struct NumBuffer {
     num: u32,
     used: bool,
-    snap: ttcore::state::Snap,
 }
 
 impl NumBuffer {
-    fn get_num(&mut self, min: u32) -> u32 {
+    fn get_num(&mut self) -> u32 {
         self.used = true;
-        self.num.max(min)
+        self.num
     }
 
-    fn push_num(&mut self, c: char) -> Result<()> {
+    fn push_num(&mut self, digit: u32) {
         if self.used {
-            self.num = c.to_string().parse::<u32>()?;
+            self.num = digit;
             self.used = false;
         } else {
-            self.num = self.num * 10 + c.to_string().parse::<u32>()?;
+            self.num = self.num * 10 + digit;
         }
-        Ok(())
     }
 
     fn pop_num(&mut self) {
@@ -313,9 +318,9 @@ impl NumBuffer {
 }
 
 #[derive(Default)]
-struct Hold {
-    onset: bool,
-    phrase: bool,
+struct Ramp {
+    value: u8,
+    delta: u8,
 }
 
 pub struct App {
@@ -327,15 +332,17 @@ pub struct App {
     audio_stream: Option<cpal::Stream>,
     audio_tx: std::sync::mpsc::Sender<audio::Cmd>,
 
-    hold: Hold,
+    legato: bool,
+    sustain: bool,
 
     onset_downs: Vec<u8>,
-    speed_starts: [f32; SPEED_COUNT],
-    speed_downs: Vec<u8>,
+    gain_ramp: Ramp,
+    pitch_ramp: Ramp,
 
+    num_lock: bool,
     num_buffer: NumBuffer,
     record_mask: Option<Vec<u8>>,
-    state_handler: ttcore::state::StateHandler<KIT_COUNT, PHRASE_COUNT, PHRASE_LEN>,
+    state_handler: ttcore::state::StateHandler<BANK_COUNT, LAYER_COUNT, KIT_COUNT, KIT_LEN, PHRASE_COUNT, PHRASE_LEN>,
 }
 
 impl App {
@@ -346,18 +353,23 @@ impl App {
         let bytes1 = std::fs::read("kits/face a.ttk").unwrap();
         let bytes2 = std::fs::read("kits/Dennis Coffey - Scorpio (cd).ttk").unwrap();
         let bytes3 = std::fs::read("kits/James Brown - Cold Sweat (ver.2).ttk").unwrap();
-        let mut state_handler = ttcore::state::StateHandler::new();
+        let mut state_handler = ttcore::state::StateHandler::new(
+            INIT_PHRASE_SNAP_START,
+            INIT_PHRASE_SNAP_LEN,
+            INIT_PITCH_INTERVAL,
+            INIT_RAMP_SNAP,
+            INIT_TICKS_PER_INPUT,
+            INIT_TICKS_PER_BEAT,
+            INIT_TICKS_PER_STEP,
+            INIT_STEPS_PER_MEAS,
+        );
         // FIXME: remove dev defaults
-        state_handler.set_record_start_snap(ttcore::state::Snap::Onset);
-        state_handler.set_record_len_snap(ttcore::state::Snap::Beat);
         state_handler.kits = [
-            Some(serde_json::from_slice::<ttcore::state::Kit>(&bytes0).unwrap()),
-            Some(serde_json::from_slice::<ttcore::state::Kit>(&bytes1).unwrap()),
-            Some(serde_json::from_slice::<ttcore::state::Kit>(&bytes2).unwrap()),
-            Some(serde_json::from_slice::<ttcore::state::Kit>(&bytes3).unwrap()),
+            Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes0).unwrap()),
+            Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes1).unwrap()),
+            Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes2).unwrap()),
+            Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes3).unwrap()),
         ];
-        state_handler.ticks_per_beat = 16;
-        state_handler.ticks_per_input = 8;
         Self {
             quit: false,
 
@@ -367,16 +379,26 @@ impl App {
             audio_stream: None,
             audio_tx,
 
-            hold: Hold::default(),
+            legato: false,
+            sustain: false,
 
             onset_downs: Vec::new(),
-            speed_starts: [0.5, 1.0, 1.5, 2.0], // FIXME: remove dev defaults
-            speed_downs: Vec::new(),
+            gain_ramp: Ramp::default(),
+            pitch_ramp: Ramp::default(),
 
+            num_lock: false,
             num_buffer: NumBuffer::default(),
             record_mask: None,
             state_handler,
         }
+    }
+
+    fn binary_offset(downs: &[u8], index: u8, count: u8) -> u32 {
+        downs
+            .iter()
+            .skip(1)
+            .map(|v| v.checked_sub(index + 1).unwrap_or(v + count - 1 - index))
+            .fold(0u32, |acc, v| acc | (1 << v))
     }
 
     pub fn run(mut self, mut terminal: ratatui::DefaultTerminal, mut input_rx: futures::channel::mpsc::UnboundedReceiver<Cmd>, mut midi_out: midir::MidiOutputConnection) -> Result<()> {
@@ -390,99 +412,191 @@ impl App {
         Ok(())
     }
 
-    fn binary_offset(&self, downs: &[u8], index: u8, count: u8) -> u32 {
-        downs
-            .iter()
-            .skip(1)
-            .map(|v| v.checked_sub(index + 1).unwrap_or(v + count - 1 - index))
-            .fold(0u32, |acc, v| acc | (1 << v))
-    }
-
-    fn send(&mut self, state: ttcore::state::ModState<ttcore::state::OnsetEvent<ttcore::state::Onset>>) -> Result<()> {
-        self.audio_tx.send(audio::Cmd::PushState(state))?;
-        Ok(())
-    }
-
-    fn push_speed(&mut self, index: u8, down: bool) -> Result<()> {
-        if down { self.speed_downs.push(index) } else { self.speed_downs.retain(|v| *v != index) }
-        let state = if let Some(&index) = self.speed_downs.first() {
-            let mult = if self.speed_downs.len() > 1 {
-                let mut offset = self.binary_offset(&self.speed_downs, index, SPEED_COUNT as u8) as i32;
-                if (offset >> SPEED_COUNT - 2) & 1 == 1 {
-                    offset |= !((1 << SPEED_COUNT - 1) - 1);
-                }
-                let mult = offset as f32 / 2u32.pow(SPEED_COUNT as u32 - 1) as f32 + 1.;
-                Some((mult + 4.)/5.)
-            } else {
-                None
-            };
-            self.state_handler.push_speed_ramp(
-                Some(self.speed_starts[index as usize]),
-                mult,
-            )
-        } else {
-            self.state_handler.push_speed_ramp(None, Some(1.))
-        };
-        self.send(state)?;
+    fn send(&mut self, msg: ttcore::state::Message<LAYER_COUNT>) -> Result<()> {
+        self.audio_tx.send(audio::Cmd::TTMessage(msg))?;
         Ok(())
     }
 
     fn push_onset(&mut self, index: u8, down: bool) -> Result<()> {
         if down { self.onset_downs.push(index) } else { self.onset_downs.retain(|v| *v != index) }
-        let state = if let Some(&index) = self.onset_downs.first() {
-            if self.onset_downs.len() > 1 {
-                // push loop start
-                let len = self.binary_offset(&self.onset_downs, index, ONSET_COUNT as u8);
-                self.state_handler.push_onset(ttcore::OnsetInput::Loop { index, len })
+        if down || !self.legato {
+            let msg = if let Some(&index) = self.onset_downs.first() {
+                if self.onset_downs.len() > 1 {
+                    // push loop start
+                    let len = Self::binary_offset(&self.onset_downs, index, LAYER_COUNT as u8);
+                    self.state_handler.push_onset(ttcore::OnsetInput::Loop { index, len })
+                } else {
+                    // push loop stop | jump
+                    self.state_handler.push_onset(ttcore::OnsetInput::Hold { index })
+                }
             } else {
-                // push loop stop | jump
-                self.state_handler.push_onset(ttcore::OnsetInput::Hold { index })
-            }
-        } else {
-            if self.hold.onset {
-                return Ok(());
-            }
-            // push sync
-            self.state_handler.push_onset(ttcore::OnsetInput::Sync)
-        };
-        self.send(state)?;
+                // push sync
+                self.state_handler.push_onset(ttcore::OnsetInput::Stop)
+            };
+            self.send(msg)?;
+        }
         Ok(())
     }
 
-    fn push_state(&mut self, input: ttcore::StateInput) -> Result<()> {
-        let state = self.state_handler.push_state(input);
-        self.send(state)?;
-        Ok(())
-    }
-
-    fn push_phrase(&mut self, index: u8) -> Result<()> {
+    fn push_phrase(&mut self, index: u8, down: bool) -> Result<()> {
         if let Some(mask) = self.record_mask.as_mut() {
-            mask.retain(|i| *i != index);
-            mask.push(index);
+            if down {
+                mask.retain(|i| *i != index);
+                mask.push(index);
+            }
+        } else if down || !self.sustain {
+            let input = if down {
+                ttcore::PhraseInput::Hold { index }
+            } else {
+                ttcore::PhraseInput::Stop
+            };
+            let msg = self.state_handler.push_phrase(input);
+            self.send(msg)?;
+        }
+        Ok(())
+    }
+
+    fn push_record(&mut self, down: bool) -> Result<()> {
+        let input = if down {
+            ttcore::RecordInput::Start
         } else {
-            let state = self.state_handler.push_phrase(ttcore::PhraseInput::Push { index });
-            self.send(state)?;
+            self.set_legato(false)?;
+            ttcore::RecordInput::Stop
+        };
+        let msg = self.state_handler.push_record(input);
+        self.send(msg)
+    }
+
+    fn set_gain(&mut self, index: u8, down: bool) -> Result<()> {
+        if down {
+            self.gain_ramp.value |= 1 << index;
+            let gain = if self.gain_ramp.value & 1 == 1 {
+                -((self.gain_ramp.value >> 1) as i8 & 7)
+            } else {
+                (self.gain_ramp.value >> 1) as i8 & 7
+            } as f32 / 7.;
+            let msg = self.state_handler.set_gain(gain);
+            self.send(msg)?;
+        } else {
+            self.gain_ramp.value &= !(1 << index)
+        };
+        Ok(())
+    }
+
+    fn ramp_gain(&mut self, index: u8, down: bool) -> Result<()> {
+        if down { self.gain_ramp.delta |= 1 << index } else { self.gain_ramp.delta  &= !(1 << index) };
+        let gain = if self.gain_ramp.delta & 1 == 1 {
+            -((self.gain_ramp.delta >> 1) as i8 & 7)
+        } else {
+            (self.gain_ramp.delta >> 1) as i8 & 7
+        } as f32 / 7.;
+        let msg = self.state_handler.ramp_gain(gain);
+        self.send(msg)?;
+        Ok(())
+    }
+
+    fn set_pitch(&mut self, index: u8, down: bool) -> Result<()> {
+        if down {
+            self.pitch_ramp.value |= 1 << index;
+            let pitch = (if self.pitch_ramp.value & 1 == 1 {
+                -((self.pitch_ramp.value >> 1) as i8 & 7)
+            } else {
+                (self.pitch_ramp.value >> 1) as i8 & 7
+            } * 16) as f32 / 7.;
+            let msg = self.state_handler.set_pitch(pitch);
+            self.send(msg)?;
+        } else {
+            self.pitch_ramp.value &= !(1 << index)
+        };
+        Ok(())
+    }
+
+    fn ramp_pitch(&mut self, index: u8, down: bool) -> Result<()> {
+        if down { self.pitch_ramp.delta |= 1 << index } else { self.pitch_ramp.delta  &= !(1 << index) };
+        let pitch = (if self.pitch_ramp.delta & 1 == 1 {
+            -((self.pitch_ramp.delta >> 1) as i8 & 7)
+        } else {
+            (self.pitch_ramp.delta >> 1) as i8 & 7
+        } * 16) as f32 / 7.;
+        let msg = self.state_handler.ramp_pitch(pitch);
+        self.send(msg)?;
+        Ok(())
+    }
+
+    fn push_kit(&mut self, bank: u8, index: u8) {
+        self.state_handler.kit_indices[bank as usize] = index;
+    }
+
+    fn set_legato(&mut self, value: bool) -> Result<()> {
+        self.legato = value;
+        if !self.legato && self.onset_downs.is_empty() {
+            let msg = self.state_handler.push_onset(ttcore::OnsetInput::Stop);
+            self.send(msg)?;
         }
         Ok(())
     }
 
-    fn pop_phrase(&mut self, index: u8) -> Result<()> {
-        if self.record_mask.is_none() && !self.hold.phrase {
-            let state = self.state_handler.push_phrase(ttcore::PhraseInput::Pop { index });
-            self.send(state)?;
+    fn key_event(&mut self, key: u8, down: bool) -> Result<()> {
+        if self.num_lock {
+            match 63 - key {
+                4 => if down { self.num_lock = down },
+                5 => if down { self.num_buffer.push_num(0) },
+                6 => if down { self.num_buffer.pop_num() },
+                7 => if down {
+                    let msg = self.state_handler.set_steps_per_meas(self.num_buffer.get_num());
+                    self.send(msg)?;
+                }
+                12 => if down { self.num_buffer.push_num(1) },
+                13 => if down { self.num_buffer.push_num(2) },
+                14 => if down { self.num_buffer.push_num(3) },
+                15 => if down {
+                    let msg = self.state_handler.set_ticks_per_step(self.num_buffer.get_num());
+                    self.send(msg)?;
+                }
+                20 => if down { self.num_buffer.push_num(4) },
+                21 => if down { self.num_buffer.push_num(5) },
+                22 => if down { self.num_buffer.push_num(6) },
+                23 => if down {
+                    let msg = self.state_handler.set_ticks_per_input(self.num_buffer.get_num());
+                    self.send(msg)?;
+                }
+                28 => if down { self.num_buffer.push_num(7) },
+                29 => if down { self.num_buffer.push_num(8) },
+                30 => if down { self.num_buffer.push_num(9) },
+                31 => if down {
+                    let msg = self.state_handler.set_ticks_per_beat(self.num_buffer.get_num());
+                    self.send(msg)?;
+                }
+                36 => if down { self.state_handler.phrase_snap_start = ttcore::state::Snap::Micro },
+                37 => if down { self.state_handler.phrase_snap_start = ttcore::state::Snap::Macro },
+                38 => if down { self.state_handler.phrase_snap_len = ttcore::state::Snap::Micro },
+                39 => if down { self.state_handler.phrase_snap_len = ttcore::state::Snap::Macro },
+                44 => if down { self.state_handler.mod_phrase_start(-(self.num_buffer.get_num() as i32)) },
+                45 => if down { self.state_handler.mod_phrase_start(self.num_buffer.get_num() as i32) },
+                46 => if down { self.state_handler.mod_phrase_len(-(self.num_buffer.get_num() as i32)) },
+                47 => if down { self.state_handler.mod_phrase_len(self.num_buffer.get_num() as i32) },
+                _ => (),
+            }
+        } else {
+            match 63 - key {
+                4 => self.num_lock = down,
+                10 => self.push_record(down)?,
+                11 => self.sustain = down,
+                12 => if down { self.set_legato(!self.legato)? },
+                13 => if down { self.state_handler.layer = 1 } else { self.state_handler.layer = 0 },
+                14 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Micro },
+                15 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Macro },
+                k if (24..32).contains(&k) => self.push_phrase(k-24, down)?,
+                k if (32..40).contains(&k) => self.push_onset(k-32,down)?,
+                k if (40..44).contains(&k) => self.set_pitch(k-40,down)?,
+                k if (44..48).contains(&k) => self.ramp_pitch(3-(k-44),down)?,
+                k if (48..52).contains(&k) => self.set_gain(k-48,down)?,
+                k if (52..56).contains(&k) => self.ramp_gain(3-(k-52),down)?,
+                k if (56..60).contains(&k) => if down { self.push_kit(0,k-56) },
+                k if (60..64).contains(&k) => if down { self.push_kit(1,k-60) },
+                _ => (),
+            }
         }
-        Ok(())
-    }
-
-    fn start_record(&mut self) -> Result<()> {
-        let state = self.state_handler.push_record(ttcore::RecordInput::Start);
-        self.send(state)?;
-        Ok(())
-    }
-
-    fn store_record(&mut self) -> Result<()> {
-        let state = self.state_handler.push_record(ttcore::RecordInput::Store);
-        self.send(state)?;
         Ok(())
     }
 
@@ -514,95 +628,6 @@ impl App {
                     match event {
                         press!(-Esc) => self.quit = true,
                         press!('`') => self.dialog.open = true,
-                        // onset inputs
-                        press!('c') => self.push_onset(0, true)?,
-                        release!('c') => self.push_onset(0, false)?,
-                        press!('r') => self.push_onset(1, true)?,
-                        release!('r') => self.push_onset(1, false)?,
-                        press!('s') => self.push_onset(2, true)?,
-                        release!('s') => self.push_onset(2, false)?,
-                        press!('t') => self.push_onset(3, true)?,
-                        release!('t') => self.push_onset(3, false)?,
-                        press!('n') => self.push_onset(4, true)?,
-                        release!('n') => self.push_onset(4, false)?,
-                        press!('e') => self.push_onset(5, true)?,
-                        release!('e') => self.push_onset(5, false)?,
-                        press!('i') => self.push_onset(6, true)?,
-                        release!('i') => self.push_onset(6, false)?,
-                        press!('a') => self.push_onset(7, true)?,
-                        release!('a') => self.push_onset(7, false)?,
-                        // phrase inputs
-                        press!('q') => self.push_phrase(0)?,
-                        release!('q') => self.pop_phrase(0)?,
-                        press!('j') => self.push_phrase(1)?,
-                        release!('j') => self.pop_phrase(1)?,
-                        press!('v') => self.push_phrase(2)?,
-                        release!('v') => self.pop_phrase(2)?,
-                        press!('d') => self.push_phrase(3)?,
-                        release!('d') => self.pop_phrase(3)?,
-                        press!('h') => self.push_phrase(4)?,
-                        release!('h') => self.pop_phrase(4)?,
-                        press!('/') => self.push_phrase(5)?,
-                        release!('/') => self.pop_phrase(5)?,
-                        press!(',') => self.push_phrase(6)?,
-                        release!(',') => self.pop_phrase(6)?,
-                        press!('.') => self.push_phrase(7)?,
-                        release!('.') => self.pop_phrase(7)?,
-                        // speed inputs
-                        press!('w') => self.push_speed(0, true)?,
-                        release!('w') => self.push_speed(0, false)?,
-                        press!('l') => self.push_speed(1, true)?,
-                        release!('l') => self.push_speed(1, false)?,
-                        press!('y') => self.push_speed(2, true)?,
-                        release!('y') => self.push_speed(2, false)?,
-                        press!('p') => self.push_speed(3, true)?,
-                        release!('p') => self.push_speed(3, false)?,
-                        // active phrase
-                        repeat!(-Delete) => self.state_handler.mod_active_phrase_start(-((self.num_buffer.get_num(1)) as i32), self.num_buffer.snap),
-                        press!(-End) => self.state_handler.set_active_phrase_start(self.num_buffer.get_num(1), self.num_buffer.snap),
-                        repeat!(-PageDown) => self.state_handler.mod_active_phrase_start((self.num_buffer.get_num(1)) as i32, self.num_buffer.snap),
-                        repeat!(-Insert) => self.state_handler.mod_active_phrase_len(-((self.num_buffer.get_num(1)) as i32), self.num_buffer.snap),
-                        press!(-Home) => self.state_handler.set_active_phrase_len(self.num_buffer.get_num(1), self.num_buffer.snap),
-                        repeat!(-PageUp) => self.state_handler.mod_active_phrase_len((self.num_buffer.get_num(1)) as i32, self.num_buffer.snap),
-                        // record
-                        press!(' ') => self.start_record()?,
-                        release!(' ') => self.store_record()?,
-                        press!(+RightShift) => self.record_mask = Some(Vec::new()),
-                        release!(+RightShift) => if let Some(mask) = self.record_mask.take() {
-                            self.state_handler.set_record_mask(&mask);
-                        }
-                        // kit
-                        press!('k') => self.state_handler.kit_index = 0,
-                        press!('x') => self.state_handler.kit_index = 1,
-                        press!('g') => self.state_handler.kit_index = 2,
-                        press!('m') => self.state_handler.kit_index = 3,
-                        // num buffer
-                        press!(c) if c.is_ascii_digit() => self.num_buffer.push_num(c)?,
-                        press!(-Backspace) => self.num_buffer.pop_num(),
-                        // snap
-                        press!('f') => self.num_buffer.snap = ttcore::state::Snap::Tick,
-                        press!('o') => self.num_buffer.snap = ttcore::state::Snap::Beat,
-                        press!('u') => self.num_buffer.snap = ttcore::state::Snap::Input,
-                        press!('\'') => self.num_buffer.snap = ttcore::state::Snap::Onset,
-                        press!('-') => self.state_handler.set_ramp_snap(self.num_buffer.snap),
-                        press!('=') => self.state_handler.set_record_start_snap(self.num_buffer.snap),
-                        press!('\\') => self.state_handler.set_record_len_snap(self.num_buffer.snap),
-                        press!('[') => self.audio_tx.send(audio::Cmd::TicksPerBeat(self.num_buffer.get_num(1)))?,
-                        press!(']') => self.audio_tx.send(audio::Cmd::TicksPerInput(self.num_buffer.get_num(1)))?,
-                        press!(-CapsLock) => self.audio_tx.send(audio::Cmd::Tempo(self.num_buffer.get_num(1) as f32))?,
-                        // reverse
-                        press!(+LeftShift) => self.push_state(ttcore::StateInput::Reverse(true))?,
-                        release!(+LeftShift) => self.push_state(ttcore::StateInput::Reverse(false))?,
-                        // hold
-                        press!(-Enter) => self.hold.phrase = true,
-                        release!(-Enter) => self.hold.phrase = false,
-                        press!(';') => {
-                            self.hold.onset = !self.hold.onset;
-                            if !self.hold.onset && self.onset_downs.is_empty() {
-                                let state = self.state_handler.push_onset(ttcore::OnsetInput::Sync);
-                                self.send(state)?;
-                            }
-                        },
                         _ => (),
                     }
                 }
@@ -610,15 +635,19 @@ impl App {
             }
             cmd = cmd_fut => {
                 match cmd? {
-                    Cmd::Tick { tick, active_state, active_mod, ticks_per_beat, ticks_per_input } => {
-                        self.throbber.high = tick.rem_euclid(self.state_handler.ticks_per_beat as i32) < self.state_handler.ticks_per_beat as i32 / 4;
-                        self.state_handler.ticks_per_beat = ticks_per_beat;
-                        self.state_handler.ticks_per_input = ticks_per_input;
-                        let state = self.state_handler.tick(tick, active_state, active_mod);
-                        self.audio_tx.send(audio::Cmd::PushState(state))?;
+                    Cmd::Tick(msg) => {
+                        self.throbber.step = msg.tick / self.state_handler.get_ticks_per_step() as i32;
+                        self.throbber.high = msg.tick.rem_euclid(self.state_handler.get_ticks_per_beat() as i32) < self.state_handler.get_ticks_per_beat() as i32 / 3;
+                        let msg = self.state_handler.tick(msg);
+                        self.audio_tx.send(audio::Cmd::TTMessage(msg))?;
                         // midi clock
                         let event = midly::live::SystemRealtime::TimingClock;
                         midi_out.send(&[event.encode()])?;
+                    }
+                    Cmd::Midi(msg) => match msg {
+                        midly::MidiMessage::NoteOff { key, .. } => self.key_event(key.as_int(), false)?,
+                        midly::MidiMessage::NoteOn { key, .. } => self.key_event(key.as_int(), true)?,
+                        _ => (),
                     }
                 }
                 Ok(())

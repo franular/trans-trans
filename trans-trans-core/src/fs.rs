@@ -89,14 +89,14 @@ pub trait FileHandler: ErrorType {
 }
 
 struct FadeState {
-    pan: f32,
     ready: bool,
     fade_index: f32,
     window_index: usize,
-    sample_rate: Option<u32>,
+    /// (sample rate, mods)
+    onset_data: Option<(u32, state::Mods)>,
 }
 
-pub struct GrainReader {
+pub(crate) struct GrainReader {
     grain: [i16; GRAIN_LEN * 2 + 1],
     grain_index: f32,
     fade: [i16; FADE_LEN * 2 + 1],
@@ -113,40 +113,35 @@ impl GrainReader {
         sample_a * (index.ceil() - index) + sample_b * (index - index.floor())
     }
 
-    fn calc_pan<const ONSET_COUNT: usize>(index: u8) -> f32 {
-        index as f32 / ONSET_COUNT as f32 - 0.5
-    }
-
-    fn pan_sample(pan: f32, sample: f32) -> (f32, f32) {
-        let l = f32::tanh(sample * ((pan + 0.5).abs() - 1.));
-        let r = f32::tanh(sample * ((pan - 0.5).abs() - 1.));
+    /// pan ranges from 0. (full left) to 1. (full right)
+    fn mixdown_sample(sample: f32, pan: f32, gain: f32) -> (f32, f32) {
+        let l = f32::tanh(sample * gain * (1. - pan));
+        let r = f32::tanh(sample * gain * pan);
         (l, r)
     }
 
     pub fn fade<const ONSET_COUNT: usize, F: FileHandler>(
         &mut self,
-        onset: Option<(u8, &mut signal::Onset<F>)>,
+        onset: Option<&mut state::Modded<signal::Onset<F>>>,
         fs: &mut F,
     ) -> Result<(), F::Error> {
-        if let Some((index, onset)) = onset {
+        if let Some(onset) = onset {
             self.fade_state = Some(FadeState {
-                pan: Self::calc_pan::<ONSET_COUNT>(index),
                 ready: false,
                 fade_index: self.grain_index - self.grain_index.floor(),
                 window_index: 0,
-                sample_rate: Some(onset.sample_rate),
+                onset_data: Some((onset.inner.sample_rate, onset.mods.clone())),
             });
-            let seek_to = onset.pos(fs)? as i64 + self.grain_index.floor() as i64 * 2 - GRAIN_LEN as i64 * 4;
-            onset.seek(seek_to, fs)?;
+            let seek_to = onset.inner.pos(fs)? as i64 + self.grain_index.floor() as i64 * 2 - GRAIN_LEN as i64 * 4;
+            onset.inner.seek(seek_to, fs)?;
             let bytes = bytemuck::cast_slice_mut(&mut self.fade);
-            onset.read(bytes, fs)?;
+            onset.inner.read(bytes, fs)?;
         } else {
             self.fade_state = Some(FadeState {
-                pan: 1.,
                 ready: false,
                 fade_index: self.grain_index - self.grain_index.floor(),
                 window_index: 0,
-                sample_rate: None,
+                onset_data: None,
             });
             self.fade.fill(0);
         }
@@ -180,15 +175,12 @@ impl GrainReader {
 
     fn advance_indices<F: FileHandler>(
         &mut self,
-        speed: f32,
-        reverse: bool,
-        onset: Option<&mut signal::Onset<F>>,
+        onset: Option<&mut state::Modded<signal::Onset<F>>>,
         sample_rate: u32,
     ) {
         if let Some(onset) = onset {
             let grain_delta = f32::from_bits(
-                (speed * onset.sample_rate as f32 / sample_rate as f32).to_bits()
-                    | (reverse as u32) << 31,
+                (onset.mods.speed * onset.inner.sample_rate as f32 / sample_rate as f32).to_bits() | (onset.mods.reverse as u32) << 31,
             );
             self.grain_index += grain_delta;
         }
@@ -199,11 +191,11 @@ impl GrainReader {
             }
             linear / (1. + sqr(core::f32::consts::FRAC_PI_2 * linear * window_index as f32 / FADE_LEN as f32))
         };
-        if let Some(FadeState { fade_index, window_index, sample_rate: sr, .. }) = self.fade_state.as_mut() {
-            let linear = if let Some(sr) = sr {
-                f32::from_bits((speed * *sr as f32 / sample_rate as f32).to_bits() | (reverse as u32) << 31)
+        if let Some(FadeState { fade_index, window_index, onset_data, .. }) = self.fade_state.as_mut() {
+            let linear = if let Some((sr, mods)) = onset_data {
+                f32::from_bits((mods.speed * *sr as f32 / sample_rate as f32).to_bits() | (mods.reverse as u32) << 31)
             } else {
-                f32::from_bits(speed.to_bits() | (reverse as u32) << 31)
+                1.
             };
             *fade_index += fade_delta(linear, *window_index);
             *window_index += 1;
@@ -213,53 +205,51 @@ impl GrainReader {
         }
     }
 
-    fn with_fade(&self, grain_pan: f32, grain_sample: f32) -> (f32, f32) {
-        if let Some(FadeState { pan, fade_index, window_index, .. }) = self.fade_state {
+    fn with_fade(&self, mut grain_sample: f32, grain_mods: Option<&state::Mods>) -> (f32, f32) {
+        let (fl, fr) = if let Some(FadeState { fade_index, window_index, onset_data: ref playback_data, .. }) = self.fade_state {
             let window = self.window[window_index];
-            let (fl, fr) = Self::pan_sample(
-                pan,
-                Self::at_interpolated(&self.fade, fade_index) * (1. - window)
-            );
-            let (gl, gr) = Self::pan_sample(
-                grain_pan,
-                grain_sample * window,
-            );
-            (fl + gl, fr + gr)
+            grain_sample *= window;
+            if let Some((_, mods)) = playback_data {
+                Self::mixdown_sample(
+                    Self::at_interpolated(&self.fade, fade_index) * (1. - window),
+                    mods.pan,
+                    mods.gain,
+                )
+            } else {
+                (0., 0.)
+            }
         } else {
-            Self::pan_sample(
-                grain_pan,
-                grain_sample,
-            )
-        }
+            (0., 0.)
+        };
+        let (gl, gr) = if let Some(mods) = grain_mods {
+            Self::mixdown_sample(grain_sample, mods.pan, mods.gain)
+            } else {
+            (0., 0.)
+        };
+        (fl + gl, fr + gr)
     }
 
-    /// returns `(tick delta, left sample, right sample)`
+    /// returns `(left sample, right sample)`
     pub fn read<const ONSET_COUNT: usize, F: FileHandler>(
         &mut self,
-        ticks_per_beat: u32,
-        tempo: f32,
-        state: &mut state::State<signal::Onset<F>>,
+        event: &mut state::OnsetEvent<state::Modded<signal::Onset<F>>>,
         sample_rate: u32,
         fs: &mut F,
-    ) -> Result<(f32, f32, f32), F::Error> {
-        let tick_delta = f32::from_bits(
-            (ticks_per_beat as f32 * tempo / (60. * sample_rate as f32)).to_bits()
-                | (state.reverse as u32) << 31,
-        );
-        match &mut state.event {
-            state::OnsetEvent::Sync => {
-                self.advance_indices::<F>(state.speed, state.reverse, None, sample_rate);
-                let (l, r) = self.with_fade(1., 0.);
-                Ok((tick_delta, l, r))
-            }
-            state::OnsetEvent::Hold { onset, index, .. } | state::OnsetEvent::Loop { onset, index, .. } => {
-                self.fill(onset, fs)?;
+    ) -> Result<(f32, f32), F::Error> {
+        match event {
+            state::OnsetEvent::Stop => {
+                let (l, r) = self.with_fade(0., None);
+                self.advance_indices::<F>(None, sample_rate);
+                Ok((l, r))
+            },
+            state::OnsetEvent::Hold { onset, .. } | state::OnsetEvent::Loop { onset, .. } => {
+                self.fill(&mut onset.inner, fs)?;
                 let (l, r) = self.with_fade(
-                    Self::calc_pan::<ONSET_COUNT>(*index),
                     Self::at_interpolated(&self.grain, self.grain_index),
+                    Some(&onset.mods),
                 );
-                self.advance_indices(state.speed, state.reverse, Some(onset), sample_rate);
-                Ok((tick_delta, l, r))
+                self.advance_indices(Some(onset), sample_rate);
+                Ok((l, r))
             }
         }
     }

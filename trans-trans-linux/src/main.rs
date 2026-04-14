@@ -5,6 +5,7 @@
 use std::io::Write;
 
 use color_eyre::Result;
+use futures::SinkExt;
 
 mod audio;
 mod fs;
@@ -22,25 +23,51 @@ fn main() -> Result<()> {
     let (audio_tx, audio_rx) = std::sync::mpsc::channel();
     let (input_tx, input_rx) = futures::channel::mpsc::unbounded();
 
-    let midi_out = midir::MidiOutput::new("trans-trans-midi-out")?;
+    let midi_in = midir::MidiInput::new("trans-trans")?;
+    // get an input port (read from console if multiple are available)
+    let in_ports = midi_in.ports();
+    let in_port: &midir::MidiInputPort = match in_ports.len() {
+        0 => panic!("no input port found"),
+        1 => {
+            println!(
+                "\nselected only available input port: {}",
+                midi_in.port_name(&in_ports[0]).unwrap()
+            );
+            &in_ports[0]
+        }
+        _ => {
+            println!("\navailable input ports:");
+            for (i, p) in in_ports.iter().enumerate() {
+                println!("{}: {}", i, midi_in.port_name(p).unwrap());
+            }
+            print!("select an input port: ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            in_ports
+                .get(input.trim().parse::<usize>()?)
+                .expect("invalid input port selected")
+        }
+    };
 
-    // Get an output port (read from console if multiple are available)
+    let midi_out = midir::MidiOutput::new("trans-trans")?;
+    // get an output port (read from console if multiple are available)
     let out_ports = midi_out.ports();
     let out_port: &midir::MidiOutputPort = match out_ports.len() {
         0 => panic!("no output port found"),
         1 => {
             println!(
-                "Choosing the only available output port: {}",
+                "selected only available output port: {}",
                 midi_out.port_name(&out_ports[0]).unwrap()
             );
             &out_ports[0]
         }
         _ => {
-            println!("\nAvailable output ports:");
+            println!("\navailable output ports:");
             for (i, p) in out_ports.iter().enumerate() {
                 println!("{}: {}", i, midi_out.port_name(p).unwrap());
             }
-            print!("Please select output port: ");
+            print!("select output port: ");
             std::io::stdout().flush()?;
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
@@ -49,9 +76,17 @@ fn main() -> Result<()> {
                 .expect("invalid output port selected")
         }
     };
-    println!("\nOpening connection");
-    let mut conn_out = midi_out.connect(out_port, "trans-trans").unwrap();
-    println!("Connection open. Listen!");
+    let _midi_in = midi_in.connect(
+        in_port,
+        "trans-trans",
+        move |_, message, input_tx: &mut futures::channel::mpsc::UnboundedSender::<input::Cmd>| {
+            if let midly::live::LiveEvent::Midi { message, .. } = midly::live::LiveEvent::parse(message).unwrap() {
+                futures::executor::block_on(input_tx.send(input::Cmd::Midi(message))).unwrap();
+            }
+        },
+        input_tx.clone(),
+    ).expect("failed to connect to midi input");
+    let midi_out = midi_out.connect(out_port, "trans-trans").expect("failed to connect to midi output");
 
     unsafe { audio::AUDIO_HANDLER.replace(audio::AudioHandler::new(audio_rx, input_tx)) };
     let app = input::App::new(audio_tx);
@@ -69,7 +104,7 @@ fn main() -> Result<()> {
         ),
     )?;
 
-    let app_result = app.run(terminal, input_rx, conn_out);
+    let app_result = app.run(terminal, input_rx, midi_out);
     crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,

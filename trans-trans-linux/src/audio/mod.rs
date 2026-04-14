@@ -5,30 +5,30 @@ pub const SAMPLE_RATE: u32 = 48000;
 pub static mut AUDIO_HANDLER: Option<AudioHandler> = None;
 
 pub enum Cmd {
-    PushState(ttcore::state::ModState<ttcore::state::OnsetEvent<ttcore::state::Onset>>),
-    TicksPerBeat(u32),
-    TicksPerInput(u32),
+    TTMessage(ttcore::state::Message<{input::LAYER_COUNT}>),
     Tempo(f32),
 }
 
 pub struct AudioHandler {
     audio_rx: std::sync::mpsc::Receiver<Cmd>,
-    input_tx: futures::channel::mpsc::UnboundedSender<crate::input::Cmd>,
+    input_tx: futures::channel::mpsc::UnboundedSender<input::Cmd>,
 
-    signal_handler: ttcore::signal::SignalHandler<crate::fs::LinuxFileHandler>,
+    signal_handler: ttcore::signal::SignalHandler<{input::LAYER_COUNT}, crate::fs::LinuxFileHandler>,
     fs: crate::fs::LinuxFileHandler,
 }
 
 impl AudioHandler {
     pub fn new(
         audio_rx: std::sync::mpsc::Receiver<Cmd>,
-        input_tx: futures::channel::mpsc::UnboundedSender<crate::input::Cmd>,
+        input_tx: futures::channel::mpsc::UnboundedSender<input::Cmd>,
     ) -> Self {
-        let mut signal_handler = ttcore::signal::SignalHandler::new();
-        // FIXME: remove dev defaults
-        signal_handler.ticks_per_beat = 16;
-        signal_handler.ticks_per_input = 8;
-        signal_handler.tempo = 192.;
+        let signal_handler = ttcore::signal::SignalHandler::new(
+            input::INIT_TEMPO,
+            input::INIT_TICKS_PER_BEAT,
+            input::INIT_TICKS_PER_INPUT,
+            input::INIT_TICKS_PER_STEP,
+            input::INIT_STEPS_PER_MEAS,
+        );
         Self {
             audio_rx,
             input_tx,
@@ -44,26 +44,17 @@ impl AudioHandler {
     ) -> color_eyre::Result<()> {
         let mut slice = &mut data[..];
         while !slice.is_empty() {
-            if let Some(n) = self.signal_handler.read::<{input::ONSET_COUNT}>(slice, channels, SAMPLE_RATE, &mut self.fs)? {
-                let mut last_state = ttcore::state::ModState::default();
+            if let Some(n) = self.signal_handler.read::<{input::LAYER_COUNT}>(slice, channels, SAMPLE_RATE, &mut self.fs)? {
+                let mut msg = ttcore::state::Message::default();
                 // flush buffered commands
                 for cmd in self.audio_rx.try_iter() {
                     match cmd {
-                        Cmd::PushState(state) => last_state = state,
-                        Cmd::TicksPerBeat(ticks_per_beat) => self.signal_handler.ticks_per_beat = ticks_per_beat,
-                        Cmd::TicksPerInput(ticks_per_input) => self.signal_handler.ticks_per_input = ticks_per_input,
+                        Cmd::TTMessage(m) => msg = m,
                         Cmd::Tempo(tempo) => self.signal_handler.tempo = tempo,
                     }
                 }
-                let active_mod = last_state.as_unit();
-                let (tick, active_state) = self.signal_handler.tick::<{input::ONSET_COUNT}>(last_state, &mut self.fs)?;
-                self.input_tx.start_send(input::Cmd::Tick {
-                    tick,
-                    active_state,
-                    active_mod,
-                    ticks_per_beat: self.signal_handler.ticks_per_beat,
-                    ticks_per_input: self.signal_handler.ticks_per_input,
-                })?;
+                let msg = self.signal_handler.tick(msg, &mut self.fs)?;
+                self.input_tx.start_send(input::Cmd::Tick(msg))?;
                 slice = &mut slice[n..];
             } else {
                 break;

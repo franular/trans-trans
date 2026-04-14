@@ -1,274 +1,204 @@
 use super::{
-    fs::{Error, FileHandler, GrainReader},
+    fs::{Error, FileHandler},
     signal,
 };
 use embedded_io::ReadExactError;
 
-#[derive(Copy, Clone, PartialEq, Default)]
+#[derive(Copy, Clone, PartialEq)]
 pub enum Snap {
-    #[default]
-    Tick,
-    Beat,
-    Input,
-    Onset,
+    /// on tick for ramp; on step for phrase
+    Micro,
+    /// on onset for ramp; on meas for phrase
+    Macro,
 }
 
-impl std::fmt::Display for Snap {
+impl core::fmt::Display for Snap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Tick => write!(f, "tick"),
-            Self::Beat => write!(f, "beat"),
-            Self::Input => write!(f, "input"),
-            Self::Onset => write!(f, "onset"),
+            Self::Micro => write!(f, "micro"),
+            Self::Macro => write!(f, "macro"),
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum OnsetInput {
-    Sync,
+    Stop,
     Hold { index: u8 },
     Loop { index: u8, len: u32 },
 }
 
-pub enum StateInput {
-    Reverse(bool),
-}
-
 pub enum PhraseInput {
-    Push { index: u8 },
-    Pop { index: u8 },
+    Stop,
+    Hold { index: u8 },
 }
 
 pub enum RecordInput {
+    Stop,
     Start,
-    Store,
 }
 
-#[derive(Default)]
-struct Buffer {
-    onset: [Option<OnsetInput>; 2],
-    reverse: Option<bool>,
-    speed: Option<f32>,
-    phrase: Vec<PhraseInput>,
+struct Buffer<const LAYER_COUNT: usize> {
+    onsets: [[Option<OnsetInput>; 2]; LAYER_COUNT],
+    phrases: [Option<PhraseInput>; LAYER_COUNT],
     record: Option<RecordInput>,
 }
 
-struct Ramp {
-    speed: f32,
-    delta: f32,
-    snap: Snap,
-}
-
-impl Ramp {
-    fn advance_speed(&mut self) {
-        self.speed *= self.delta;
+impl<const LAYER_COUNT: usize> Default for Buffer<LAYER_COUNT> {
+    fn default() -> Self {
+        Self {
+            onsets: core::array::from_fn(|_| core::array::from_fn(|_| None)),
+            phrases: core::array::from_fn(|_| None),
+            record: None,
+        }
     }
 }
 
-impl Default for Ramp {
+struct Ramp {
+    tick: u32,
+    value: f32,
+    delta: f32,
+}
+
+impl Ramp {
+    fn new(value: f32, delta: f32) -> Self {
+        Ramp { tick: 0, value, delta }
+    }
+
+    fn advance(&mut self, advance_fn: impl Fn(f32, f32) -> f32) {
+        self.value = advance_fn(self.value, self.delta * self.tick as f32);
+        self.tick = 0;
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Mods {
+    pub pan: f32,
+    pub gain: f32,
+    pub speed: f32,
+    pub reverse: bool,
+}
+
+impl Default for Mods {
     fn default() -> Self {
-        Self { speed: 1., delta: 1., snap: Snap::Tick }
+        Self { pan: 0.5, gain: 1., speed: 1., reverse: false }
     }
 }
 
 #[derive(Debug)]
+pub struct Modded<T> {
+    pub(crate) inner: T,
+    pub(crate) mods: Mods,
+}
+
+impl<T: Clone> Clone for Modded<T> {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner.clone(), mods: self.mods.clone() }
+    }
+}
+
+impl<T: Default> Default for Modded<T> {
+    fn default() -> Self {
+        Self { inner: T::default(), mods: Mods::default() }
+    }
+}
+
+#[derive(Default)]
 pub enum OnsetEvent<O> {
-    Sync,
+    #[default]
+    Stop,
     Hold { tick: i32, onset: O, index: u8 },
     Loop { tick: i32, onset: O, index: u8, len: u32 },
 }
 
-impl From<OnsetInput> for OnsetEvent<()> {
-    fn from(value: OnsetInput) -> Self {
-        match value {
-            OnsetInput::Sync => OnsetEvent::Sync,
-            OnsetInput::Hold { index } => OnsetEvent::Hold { tick: 0, onset: (), index },
-            OnsetInput::Loop { index, len } => OnsetEvent::Loop { tick: 0, onset: (), index, len },
-        }
-    }
-}
-
-impl OnsetEvent<()> {
-    pub fn trans(
-        &self,
-        event: OnsetInput,
-    ) -> Self {
-        match event {
-            OnsetInput::Sync => OnsetEvent::Sync,
-            OnsetInput::Hold { index } => match self {
-                OnsetEvent::Sync => OnsetEvent::Hold { tick: 0, onset: (), index },
-                OnsetEvent::Hold { tick, index: i, .. } | OnsetEvent::Loop { tick, index: i, .. } => {
-                    let tick = if *i == index { *tick } else { 0 };
-                    OnsetEvent::Hold { tick, onset: (), index }
-                }
-            }
-            OnsetInput::Loop { index, len } => match self {
-                OnsetEvent::Sync => OnsetEvent::Loop { tick: 0, onset: (), index, len },
-                OnsetEvent::Hold { tick, index: i, .. } | OnsetEvent::Loop { tick, index: i, .. } => {
-                    let tick = if *i == index { tick.rem_euclid(len as i32) } else { 0 };
-                    OnsetEvent::Loop { tick, onset: (), index, len }
-                }
-            }
-        }
-    }
-
-    pub fn open(
-        &self,
-        kit: Option<&Kit>,
-    ) -> OnsetEvent<Onset> {
-        match self {
-            OnsetEvent::Sync => OnsetEvent::Sync,
-            OnsetEvent::Hold { tick, index, .. } => {
-                if let Some(kit) = kit {
-                    OnsetEvent::Hold { tick: *tick, onset: kit.onsets[*index as usize].clone(), index: *index }
-                } else {
-                    OnsetEvent::Sync
-                }
-            }
-            OnsetEvent::Loop { tick, index, len, .. } => {
-                if let Some(kit) = kit {
-                    OnsetEvent::Loop { tick: *tick, onset: kit.onsets[*index as usize].clone(), index: *index, len: *len }
-                } else {
-                    OnsetEvent::Sync
-                }
-                
-            }
-        }
-    }
-}
-
-impl Clone for OnsetEvent<()> {
+impl<O: Clone> Clone for OnsetEvent<O> {
     fn clone(&self) -> Self {
         match self {
-            Self::Sync => Self::Sync,
-            Self::Hold { tick, index, .. } => Self::Hold { tick: *tick, onset: (), index: *index },
-            Self::Loop { tick, index, len, .. } => Self::Loop { tick: *tick, onset: (), index: *index, len: *len },
+            Self::Stop => Self::Stop,
+            Self::Hold { tick, onset, index } => Self::Hold { tick: *tick, onset: onset.clone(), index: *index },
+            Self::Loop { tick, onset, index, len } => Self::Loop { tick: *tick, onset: onset.clone(), index: *index, len: *len },
         }
     }
 }
 
-impl<F: FileHandler> OnsetEvent<signal::Onset<F>> {
-    pub fn as_unit(&self) -> OnsetEvent<()> {
+impl<O> core::fmt::Debug for OnsetEvent<O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OnsetEvent::Sync => OnsetEvent::Sync,
-            OnsetEvent::Hold { tick, index, .. } => OnsetEvent::Hold { tick: *tick, onset: (), index: *index },
-            OnsetEvent::Loop { tick, index, len, .. } => OnsetEvent::Loop { tick: *tick, onset: (), index: *index, len: *len },
+            Self::Stop => write!(f, "Stop"),
+            Self::Hold { tick, index, .. } => f.debug_struct("Hold").field("tick", tick).field("index", index).finish(),
+            Self::Loop { tick, index, len, .. } => f.debug_struct("Loop").field("tick", tick).field("index", index).field("len", len).finish(),
         }
     }
+}
 
-    pub fn trans<const ONSET_COUNT: usize>(
+impl<F: FileHandler> OnsetEvent<Modded<signal::Onset<F>>> {
+    pub fn tick(
         self,
+        to: &Modded<Option<OnsetEvent<Onset>>>,
         ticks_per_beat: u32,
-        event: OnsetEvent<Onset>,
-        grain: &mut GrainReader,
         fs: &mut F,
     ) -> Result<Self, Error<F::Error>> {
-        match event {
-            OnsetEvent::Sync => match self {
-                OnsetEvent::Sync => Ok(OnsetEvent::Sync),
-                OnsetEvent::Hold { onset: mut o, index: i, .. } | OnsetEvent::Loop { onset: mut o, index: i, .. } => {
-                    grain.fade::<ONSET_COUNT, F>(Some((i, &mut o)), fs)?;
-                    fs.close(&o.file)?;
-                    Ok(OnsetEvent::Sync)
+        match to.inner {
+            None => match self {
+                OnsetEvent::Stop => Ok(OnsetEvent::Stop),
+                OnsetEvent::Hold { mut tick, mut onset, index, .. } => {
+                    tick += 1;
+                    onset.inner.seek_from_start(tick, ticks_per_beat, fs)?;
+                    onset.mods = to.mods.clone();
+                    Ok(OnsetEvent::Hold { tick, onset, index })
+                }
+                OnsetEvent::Loop { mut tick, mut onset, index, len, .. } => {
+                    tick = (tick + 1).rem_euclid(len as i32);
+                    onset.inner.seek_from_start(tick, ticks_per_beat, fs)?;
+                    onset.mods = to.mods.clone();
+                    Ok(OnsetEvent::Loop { tick, onset, index, len })
                 }
             }
-            OnsetEvent::Hold { tick, onset, index } => match self {
-                OnsetEvent::Sync => {
-                    grain.fade::<ONSET_COUNT, F>(None, fs)?;
-                    Ok(OnsetEvent::Hold { tick, onset: onset.open_seek(ticks_per_beat, tick, None, fs)?, index })
+            Some(OnsetEvent::Stop) => {
+                match self {
+                    OnsetEvent::Stop => (),
+                    OnsetEvent::Hold { onset: o, .. } | OnsetEvent::Loop { onset: o, .. } => fs.close(&o.inner.file)?,
                 }
-                OnsetEvent::Hold { onset: mut o, index: i, .. } | OnsetEvent::Loop { onset: mut o, index: i, .. } => {
-                    grain.fade::<ONSET_COUNT, F>(Some((i, &mut o)), fs)?;
-                    Ok(OnsetEvent::Hold { tick, onset: onset.open_seek(ticks_per_beat, tick, Some(o), fs)?, index })
-                }
+                Ok(OnsetEvent::Stop)
             }
-            OnsetEvent::Loop { tick, onset, index, len } => match self {
-                OnsetEvent::Sync => {
-                    grain.fade::<ONSET_COUNT, F>(None, fs)?;
-                    Ok(OnsetEvent::Loop { tick, onset: onset.open_seek(ticks_per_beat, tick, None, fs)?, index, len })
-                }
-                OnsetEvent::Hold { onset: mut o, index: i, .. } | OnsetEvent::Loop { onset: mut o, index: i, .. } => {
-                    grain.fade::<ONSET_COUNT, F>(Some((i, &mut o)), fs)?;
-                    Ok(OnsetEvent::Loop { tick, onset: onset.open_seek(ticks_per_beat, tick, Some(o), fs)?, index, len })
-                }
+            Some(OnsetEvent::Hold { tick, ref onset, index, .. }) => {
+                let o = match self {
+                    OnsetEvent::Stop => None,
+                    OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } => Some(onset),
+                };
+                let mut onset = onset.clone().open(o.map(|m| m.inner), fs)?;
+                onset.seek_from_start(tick, ticks_per_beat, fs)?;
+                Ok(OnsetEvent::Hold { tick, onset: Modded { inner: onset, mods: to.mods.clone() }, index })
+            }
+            Some(OnsetEvent::Loop { mut tick, ref onset, index, len, .. }) => {
+                tick = tick.rem_euclid(len as i32);
+                let o = match self {
+                    OnsetEvent::Stop => None,
+                    OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } => Some(onset),
+                };
+                let mut onset = onset.clone().open(o.map(|m| m.inner), fs)?;
+                onset.seek_from_start(tick, ticks_per_beat, fs)?;
+                Ok(OnsetEvent::Loop { tick, onset: Modded { inner: onset, mods: to.mods.clone() }, index, len })
             }
         }
     }
 }
 
-pub struct ModState<E> {
-    pub event: Option<E>,
-    pub reverse: Option<bool>,
-    pub speed: Option<f32>,
+#[derive(Clone)]
+pub struct Message<const LAYER_COUNT: usize> {
+    pub(crate) ticks_per_beat: u32,
+    pub(crate) ticks_per_meas: u32,
+    pub(crate) inputs: [Option<OnsetInput>; LAYER_COUNT],
+    pub(crate) events: [Modded<Option<OnsetEvent<Onset>>>; LAYER_COUNT],
 }
 
-impl<E> ModState<E> {
-    pub fn default() -> Self {
+impl<const LAYER_COUNT: usize> Default for Message<LAYER_COUNT> {
+    fn default() -> Self {
         Self {
-            event: None,
-            reverse: None,
-            speed: None,
-        }
-    }
-}
-
-impl Clone for ModState<OnsetInput> {
-    fn clone(&self) -> Self {
-        Self { event: self.event.clone(), reverse: self.reverse, speed: self.speed }
-    }
-}
-
-impl Clone for ModState<OnsetEvent<()>> {
-    fn clone(&self) -> Self {
-        Self { event: self.event.clone(), reverse: self.reverse, speed: self.speed }
-    }
-}
-
-impl ModState<OnsetEvent<Onset>> {
-    pub fn as_unit(&self) -> ModState<OnsetEvent<()>> {
-        let event = match self.event {
-            None => None,
-            Some(OnsetEvent::Sync) => Some(OnsetEvent::Sync),
-            Some(OnsetEvent::Hold { tick, index, .. }) => Some(OnsetEvent::Hold { tick, onset: (), index }),
-            Some(OnsetEvent::Loop { tick, index, len, .. }) => Some(OnsetEvent::Loop { tick, onset: (), index, len }),
-        };
-        ModState {
-            event,
-            reverse: self.reverse,
-            speed: self.speed,
-        }
-    }
-}
-
-pub struct State<O> {
-    pub event: OnsetEvent<O>,
-    pub reverse: bool,
-    pub speed: f32,
-}
-
-impl<O> State<O> {
-    pub fn default() -> Self {
-        Self {
-            event: OnsetEvent::Sync,
-            reverse: false,
-            speed: 1.,
-        }
-    }
-}
-
-impl Clone for State<()> {
-    fn clone(&self) -> Self {
-        Self { event: self.event.clone(), reverse: self.reverse, speed: 1. }
-    }
-}
-
-impl<F: FileHandler> State<signal::Onset<F>> {
-    pub fn as_unit(&self) -> State<()> {
-        State {
-            event: self.event.as_unit(),
-            reverse: self.reverse,
-            speed: self.speed,
+            ticks_per_beat: 1,
+            ticks_per_meas: 1,
+            inputs: core::array::from_fn(|_| None),
+            events: core::array::from_fn(|_| Modded::default()),
         }
     }
 }
@@ -276,23 +206,19 @@ impl<F: FileHandler> State<signal::Onset<F>> {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Onset {
     pub path: String,
-    pub start: u32,
+    pub onset_start: u32,
     pub beat_count: u32,
 }
 
 impl Onset {
-    pub fn open_seek<F: FileHandler>(
+    pub(crate) fn open<F: FileHandler>(
         self,
-        ticks_per_beat: u32,
-        tick: i32,
         replace: Option<signal::Onset<F>>,
         fs: &mut F,
     ) -> Result<signal::Onset<F>, Error<F::Error>> {
         if let Some(mut replace) = replace {
             if self.path == replace.path {
-                replace.onset_start = self.start;
-                let seek_to = replace.onset_start as i64 * 2 + ((replace.pcm_len as f32 / (replace.beat_count * ticks_per_beat) as f32 * tick as f32) as i64 & !1);
-                replace.seek(seek_to, fs)?;
+                replace.onset_start = self.onset_start;
                 return Ok(replace);
             } else {
                 fs.close(&replace.file)?;
@@ -335,23 +261,21 @@ impl Onset {
                 fs.seek(&mut file, embedded_io::SeekFrom::Current(chunk_len as i64))?;
             }
         }
-        let mut onset = signal::Onset {
+        let onset = signal::Onset {
             path: self.path,
             file,
-            sample_rate,
             pcm_start,
             pcm_len,
-            onset_start: self.start,
+            onset_start: self.onset_start,
             beat_count: self.beat_count,
+            sample_rate,
         };
-        let seek_to = onset.onset_start as i64 * 2 + ((onset.pcm_len as f32 / (onset.beat_count * ticks_per_beat) as f32 * tick as f32) as i64 & !1);
-        onset.seek(seek_to, fs)?;
         Ok(onset)
     }
 }
 
 pub struct Phrase<const PHRASE_LEN: usize> {
-    states: [ModState<OnsetEvent<()>>; PHRASE_LEN],
+    events: [Modded<Option<OnsetEvent<Onset>>>; PHRASE_LEN],
     pub start: u32,
     pub len: u32,
 }
@@ -359,7 +283,7 @@ pub struct Phrase<const PHRASE_LEN: usize> {
 impl<const PHRASE_LEN: usize> Default for Phrase<PHRASE_LEN> {
     fn default() -> Self {
         Self {
-            states: core::array::from_fn(|_| ModState::default()),
+            events: core::array::from_fn(|_| Modded::default()),
             start: 0,
             len: 0,
         }
@@ -368,8 +292,14 @@ impl<const PHRASE_LEN: usize> Default for Phrase<PHRASE_LEN> {
 
 /// running phrase reading from start..start+len ticks (wrapping) of indexed Phrase
 pub struct PhraseReader {
-    pub index: u8,
-    pub tick: u32,
+    index: u8,
+    tick: u32,
+}
+
+impl PhraseReader {
+    fn start(index: u8) -> Self {
+        Self { index, tick: 0 }
+    }
 }
 
 #[derive(Default)]
@@ -379,20 +309,19 @@ enum WriterState {
     Recording { start: u32, len: u32 },
 }
 
-struct PhraseWriter<const PHRASE_COUNT: usize, const PHRASE_LEN: usize> {
+pub struct PhraseWriter<const PHRASE_COUNT: usize, const PHRASE_LEN: usize> {
     /// indices of `StateHandler`'s Phrases which is overwritten by `Self::store`
-    /// defaults to all Phrases!
+    /// defaults to all Phrases
     store_mask: heapless::Vec<u8, PHRASE_COUNT>,
     store_index: usize,
-    queue: heapless::HistoryBuf<ModState<OnsetEvent<()>>, PHRASE_LEN>,
+    queue: heapless::HistoryBuf<Modded<Option<OnsetEvent<Onset>>>, PHRASE_LEN>,
     state: WriterState,
-    snap_start: Snap,
-    snap_len: Snap,
 }
 
 impl<const PHRASE_COUNT: usize, const PHRASE_LEN: usize> PhraseWriter<PHRASE_COUNT, PHRASE_LEN> {
-    pub fn push(&mut self, state: ModState<OnsetEvent<()>>) {
-        self.queue.write(state);
+    pub fn push(&mut self, event: Modded<Option<OnsetEvent<Onset>>>) {
+        self.queue.write(event);
+        if let WriterState::Recording { len, .. } = &mut self.state { *len += 1 };
     }
 
     /// should be called before input tick
@@ -410,7 +339,7 @@ impl<const PHRASE_COUNT: usize, const PHRASE_LEN: usize> PhraseWriter<PHRASE_COU
         if let WriterState::Recording { start, mut len } = self.state && len > min_len {
             len = len.min(PHRASE_LEN as u32);
             let phrase = Phrase {
-                states: core::array::from_fn(|i| self.queue.as_slice().get(i).cloned().unwrap_or(ModState::default())),
+                events: core::array::from_fn(|i| self.queue.as_slice().get(i).cloned().unwrap_or_default()),
                 start,
                 len,
             };
@@ -438,168 +367,343 @@ impl<const PHRASE_COUNT: usize, const PHRASE_LEN: usize> Default for PhraseWrite
             store_index: Default::default(),
             queue: Default::default(),
             state: Default::default(),
-            snap_start: Default::default(),
-            snap_len: Default::default(),
         }
     }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct Kit {
-    pub onsets: Box<[Onset]>,
+pub struct Kit<const KIT_LEN: usize> {
+    #[serde(with = "serde_arrays")]
+    pub onsets: [Option<Onset>; KIT_LEN],
 }
 
-pub struct DefaultSnap {
-    pub start: Snap,
-    pub len: Snap,
-}
+pub struct StateHandler<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, const KIT_LEN: usize, const PHRASE_COUNT: usize, const PHRASE_LEN: usize> {
+    pub layer: u8,
+    pub kits: [Option<Kit<KIT_LEN>>; KIT_COUNT],
+    pub kit_indices: [u8; BANK_COUNT],
 
-/// NOTE: the Phrase at index 0 is overwritten when a recording is stored
-pub struct StateHandler<const KIT_COUNT: usize, const PHRASE_COUNT: usize, const PHRASE_LEN: usize>
-where
-    [(); PHRASE_COUNT + 1]:,
-{
-    pub kits: [Option<Kit>; KIT_COUNT],
-    pub kit_index: u8,
-
-    pub phrase_stack: heapless::Vec<PhraseReader, {PHRASE_COUNT + 1}>,
-    phrase_writer: PhraseWriter<PHRASE_COUNT, PHRASE_LEN>,
     pub phrases: [Option<Phrase<PHRASE_LEN>>; PHRASE_COUNT],
+    pub phrase_writer: PhraseWriter<PHRASE_COUNT, PHRASE_LEN>,
+    pub phrase_snap_start: Snap,
+    pub phrase_snap_len: Snap,
 
-    active_state: State<()>,
-    input_state: State<()>,
+    buffer: Buffer<LAYER_COUNT>,
+    pub active_onsets: [OnsetEvent<Modded<Onset>>; LAYER_COUNT],
+    pub active_phrases: [Option<PhraseReader>; LAYER_COUNT],
 
-    buffer: Buffer,
-    ramp: Ramp,
+    pub pitch_interval: f32,
+    pub ramp_snap: Snap,
+    gain_ramp: Ramp,
+    pitch_ramp: Ramp,
+    pub reverse: bool,
 
-    pub pass_input: bool,
-    pub ticks_per_beat: u32,
-    pub ticks_per_input: u32,
+    pass_input: bool,
+    ticks_per_input: u32,
+    ticks_per_beat: u32,
+    /// akin to time signature denominator
+    ticks_per_step: u32,
+    /// akin to time signature numerator
+    steps_per_meas: u32,
 }
 
-impl<const KIT_COUNT: usize, const PHRASE_COUNT: usize, const PHRASE_LEN: usize> StateHandler<KIT_COUNT, PHRASE_COUNT, PHRASE_LEN>
-where
-    [(); PHRASE_COUNT + 1]: Clone,
-{
-    pub fn new() -> Self {
+impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, const KIT_LEN: usize, const PHRASE_COUNT: usize, const PHRASE_LEN: usize> StateHandler<BANK_COUNT, LAYER_COUNT, KIT_COUNT, KIT_LEN, PHRASE_COUNT, PHRASE_LEN> {
+    pub fn new(
+        phrase_snap_start: Snap,
+        phrase_snap_len: Snap,
+        pitch_interval: f32,
+        ramp_snap: Snap,
+        ticks_per_input: u32,
+        ticks_per_beat: u32,
+        ticks_per_step: u32,
+        steps_per_meas: u32,
+    ) -> Self {
         Self {
+            layer: 0,
             kits: core::array::from_fn(|_| None),
-            kit_index: 0,
+            kit_indices: [0; BANK_COUNT],
 
-            phrase_stack: heapless::Vec::new(),
-            phrase_writer: PhraseWriter::default(),
             phrases: core::array::from_fn(|_| None),
-
-            active_state: State::default(),
-            input_state: State::default(),
+            phrase_writer: PhraseWriter::default(),
+            phrase_snap_start,
+            phrase_snap_len,
 
             buffer: Buffer::default(),
-            ramp: Ramp::default(),
+            active_onsets: core::array::from_fn(|_| OnsetEvent::Stop),
+            active_phrases: core::array::from_fn(|_| None),
 
+            pitch_interval,
+            ramp_snap,
+            gain_ramp: Ramp::new(1., 0.),
+            pitch_ramp: Ramp::new(1., 0.),
+            reverse: false,
+            
             pass_input: false,
-            ticks_per_beat: 1,
-            ticks_per_input: 1,
+            ticks_per_input,
+            ticks_per_beat,
+            ticks_per_step,
+            steps_per_meas,
         }
     }
 
-    pub fn cumulative_mod(&mut self) -> ModState<OnsetEvent<Onset>> {
-        let mut state = ModState::default();
-        self.flush_speed();
-        if self.pass_input {
-            self.flush_record();
-            self.flush_phrase();
-        }
-        let mut dont_sync = false;
-        if let Some(reader) = self.top_reader() {
-            let Phrase { states, start, len } = &self.phrases[reader.index as usize].as_ref().unwrap();
-            let s = states[(start + reader.tick) as usize % PHRASE_LEN].clone();
-            if matches!(self.buffer.onset[0], Some(OnsetInput::Sync)) {
-                // return to phrase as ticked from last onset if input sync
-                dont_sync = true;
+    fn pass_net(&mut self) -> Message<LAYER_COUNT> {
+        self.try_pass();
+        self.net()
+    }
+
+    fn net(&mut self) -> Message<LAYER_COUNT> {
+        let mut net = Message {
+            ticks_per_beat: self.ticks_per_beat,
+            ticks_per_meas: self.ticks_per_step * self.steps_per_meas,
+            inputs: self.buffer.onsets.clone().map(|i| i[0].clone()),
+            events: core::array::from_fn(|idx| Modded { inner: None, mods: match &self.active_onsets[idx] {
+                OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } => onset.mods.clone(),
+                _ => Mods::default(),
+            } }),
+        };
+        for idx in 0..LAYER_COUNT {
+            let input_onset = &mut self.buffer.onsets[idx];
+            let active_onset = &mut self.active_onsets[idx];
+            let active_phrase = &mut self.active_phrases[idx];
+            let net = &mut net.events[idx];
+            if matches!(input_onset[0], Some(OnsetInput::Stop)) && let Some(phrase) = active_phrase {
+                // output synced active phrase, if any
+                let Phrase { events, start, len } = &self.phrases[phrase.index as usize].as_ref().unwrap();
                 let mut tick_offset = 0;
-                let s_index = |tick: i32| (*start as i32 + (reader.tick as i32 - tick).rem_euclid(*len as i32)).rem_euclid(PHRASE_LEN as i32) as usize;
-                while tick_offset < *len as i32 && states[s_index(tick_offset)].event.is_none() {
+                let s_index = |tick: i32| (*start as i32 + (phrase.tick as i32 - tick).rem_euclid(*len as i32)).rem_euclid(PHRASE_LEN as i32) as usize;
+                while tick_offset < *len as i32 && matches!(events[s_index(tick_offset)].inner, None | Some(OnsetEvent::Stop)) {
                     tick_offset += 1;
                 }
-                let mut s = states[s_index(tick_offset)].clone();
-                match s.event.as_mut() {
-                    Some(OnsetEvent::Hold { tick, .. }) => *tick += tick_offset,
-                    Some(OnsetEvent::Loop { tick, len, .. }) => *tick = (*tick + tick_offset).rem_euclid(*len as i32),
+                let mut e = events[s_index(tick_offset)].inner.clone();
+                match e {
+                    Some(OnsetEvent::Hold { ref mut tick, .. }) => *tick += tick_offset,
+                    Some(OnsetEvent::Loop { ref mut tick, len, .. }) => *tick = (*tick + tick_offset).rem_euclid(len as i32),
                     _ => (),
                 }
-                state.event = s.event.as_ref().map(|e| e.open(self.kits[self.kit_index as usize].as_ref()));
-            } else if matches!(self.input_state.event, OnsetEvent::Sync) {
-                // current phrase event otherwise
-                state.event = s.event.as_ref().map(|e| e.open(self.kits[self.kit_index as usize].as_ref()));
-            };
-            state.reverse = s.reverse;
-            state.speed = s.speed;
-        } else if self.buffer.onset[0].is_none() && matches!(self.input_state.event, OnsetEvent::Sync) {
-            // FIXME: wait, why is this here?
-            self.buffer.onset[0] = Some(OnsetInput::Sync);
-        }
-        if self.pass_input {
-            if let Some(event) = self.buffer.onset[0].clone() && !(dont_sync && matches!(event, OnsetInput::Sync)) {
-                state.event = Some(self.active_state.event.trans(event).open(self.kits[self.kit_index as usize].as_ref()));
+                *net = Modded { inner: e, mods: events[(start + phrase.tick) as usize % PHRASE_LEN].mods.clone() };
+            } else if matches!(active_onset, OnsetEvent::Stop) && let Some(phrase) = active_phrase {
+                // output from active phrase, if any
+                let Phrase { events, start, .. } = &self.phrases[phrase.index as usize].as_ref().unwrap();
+                *net = events[(start + phrase.tick) as usize % PHRASE_LEN].clone();
+            } else if input_onset[0].is_some() {
+                // output active onset event
+                match active_onset {
+                    OnsetEvent::Stop => net.inner = Some(OnsetEvent::Stop),
+                    OnsetEvent::Hold { tick, onset, index } => *net = Modded {
+                        inner: Some(OnsetEvent::Hold { tick: *tick, onset: onset.inner.clone(), index: *index }),
+                        mods: onset.mods.clone(),
+                    },
+                    OnsetEvent::Loop { tick, onset, index, len } => *net = Modded {
+                        inner: Some(OnsetEvent::Loop { tick: *tick, onset: onset.inner.clone(), index: *index, len: *len }),
+                        mods: onset.mods.clone(),
+                    },
+                };
             }
-            if let Some(reverse) = self.buffer.reverse {
-                state.reverse = Some(state.reverse.unwrap_or_default() ^ reverse);
-            }
-        } else {
-            state.reverse = Some(state.reverse.unwrap_or_default() ^ self.input_state.reverse);
         }
-        if let Some(speed) = self.buffer.speed {
-            state.speed = Some(state.speed.unwrap_or(1.) * speed);
-        }
-        state
+        net
     }
 
-    /// returned `ModState` should be sent to `SignalHandler`
-    pub fn push_onset(&mut self, input: OnsetInput) -> ModState<OnsetEvent<Onset>> {
+    fn try_pass(&mut self) {
+        if !self.pass_input { return };
+        for idx in 0..LAYER_COUNT {
+            let input_onset = &mut self.buffer.onsets[idx];
+            let input_phrase = &mut self.buffer.phrases[idx];
+            let active_onset = &mut self.active_onsets[idx];
+            let active_phrase = &mut self.active_phrases[idx];
+            // flush phrase input
+            if let Some(input) = input_phrase.take() {
+                match input {
+                    PhraseInput::Stop => {
+                        *active_phrase = None;
+                        if matches!(active_onset, OnsetEvent::Stop) {
+                            input_onset[0] = Some(OnsetInput::Stop)
+                        }
+                    }
+                    PhraseInput::Hold { index } => *active_phrase = if self.phrases[index as usize].is_some() {
+                        Some(PhraseReader::start(index))
+                    } else {
+                        None
+                    },
+                }
+            }
+            // pass onset input
+            if let Some(input) = input_onset[0].clone() {
+                *active_onset = match input {
+                    OnsetInput::Stop => OnsetEvent::Stop,
+                    OnsetInput::Hold { index } => if let Some(onset) = self.kits[self.kit_indices[index as usize * BANK_COUNT / KIT_LEN] as usize].as_ref().and_then(|k| k.onsets[index as usize].as_ref()) {
+                        let tick = if let OnsetEvent::Loop { tick, index: i, .. } = active_onset && *i == index {
+                            *tick
+                        } else {
+                            0
+                        };
+                        let onset = Modded {
+                            inner: onset.clone(),
+                            mods: Mods {
+                                pan: index as f32 / (KIT_LEN - 1) as f32,
+                                gain: self.gain_ramp.value,
+                                speed: self.pitch_ramp.value,
+                                reverse: self.reverse,
+                            },
+                        };
+                        OnsetEvent::Hold { tick, onset, index }
+                    } else {
+                        OnsetEvent::Stop
+                    }
+                    OnsetInput::Loop { index, len } => if let Some(onset) = self.kits[self.kit_indices[index as usize * BANK_COUNT / KIT_LEN] as usize].as_ref().and_then(|k| k.onsets[index as usize].as_ref()) {
+                        let tick = if let OnsetEvent::Hold { tick, index: i, .. } | OnsetEvent::Loop { tick, index: i, .. } = active_onset && *i == index {
+                            tick.rem_euclid(len as i32)
+                        } else {
+                            0
+                        };
+                        let onset = Modded {
+                            inner: onset.clone(),
+                            mods: Mods {
+                                pan: index as f32 / (KIT_LEN - 1) as f32,
+                                gain: self.gain_ramp.value,
+                                speed: self.pitch_ramp.value,
+                                reverse: self.reverse,
+                            },
+                        };
+                        OnsetEvent::Loop { tick, onset, index, len }
+                    } else {
+                        OnsetEvent::Stop
+                    }
+                }
+            }
+        }
+        // flush record input
+        if let Some(input) = self.buffer.record.take() {
+            match input {
+                RecordInput::Stop => {
+                    if let Some(phrase) = self.phrase_writer.try_store(self.ticks_per_input) && let Some(store_to) = self.phrase_writer.try_advance() {
+                        self.phrases[store_to as usize] = Some(phrase);
+                        let _ = self.push_phrase(PhraseInput::Hold { index: store_to });
+                        self.mod_phrase_start(0);
+                        self.mod_phrase_len(0);
+                    }
+                }
+                RecordInput::Start => self.phrase_writer.try_start(),
+            }
+        }
+    }
+
+    pub fn tick(&mut self, message: signal::Message<LAYER_COUNT>) -> Message<LAYER_COUNT> {
+        let pass_input = (message.tick + 1).rem_euclid(self.ticks_per_input as i32) == 0;
+        if pass_input {
+            // rising edge; just before input tick
+        } else if self.pass_input {
+            // falling edge; after input tick
+            for idx in 0..LAYER_COUNT {
+                // only consume current input when input has been received by SignalHandler
+                if self.buffer.onsets[idx][0] == message.inputs[idx] {
+                    self.buffer.onsets[idx][0] = self.buffer.onsets[idx][1].take();
+                }
+            }
+            if let OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } = &mut self.active_onsets[self.layer as usize] {
+                onset.mods.reverse = self.reverse;
+            }
+        }
+        for idx in 0..LAYER_COUNT {
+            match self.active_onsets[idx] {
+                OnsetEvent::Stop => (),
+                OnsetEvent::Hold { ref mut tick, .. } => *tick += 1,
+                OnsetEvent::Loop { ref mut tick, len, .. } => *tick = (*tick + 1).rem_euclid(len as i32),
+            }
+        }
+        self.pass_input = pass_input;
+        // flush ramps to top Modded
+        self.gain_ramp.tick += 1;
+        self.pitch_ramp.tick += 1;
+        if match self.ramp_snap {
+            Snap::Micro => true,
+            Snap::Macro => {
+                match self.active_onsets[self.layer as usize] {
+                    OnsetEvent::Stop => false,
+                    OnsetEvent::Hold { tick, .. } => tick == 0,
+                    OnsetEvent::Loop { tick, len, .. } => (tick + 1).rem_euclid(len as i32) == 0,
+                }
+            }
+        } {
+            self.gain_ramp.advance(|v, d| (v + d).clamp(0., 2.));
+            self.pitch_ramp.advance(|v, d| {
+                (v * self.pitch_interval.powf(d)).clamp(self.pitch_interval.powf(-16.), self.pitch_interval.powf(16.))
+            });
+        }
+        if let OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } = &mut self.active_onsets[self.layer as usize] {
+            onset.mods.gain = self.gain_ramp.value;
+            onset.mods.speed = self.pitch_ramp.value;
+        }
+        self.try_pass();
+        for reader in self.active_phrases.iter_mut().flatten() {
+            if let Some(Phrase { len, .. }) = &self.phrases[reader.index as usize] {
+                reader.tick = (reader.tick as i32 + 1).rem_euclid(*len as i32) as u32;
+            }
+        }
+        let net = self.net();
+        self.phrase_writer.push(net.events[self.layer as usize].clone());
+        net
+    }
+
+    pub fn push_onset(&mut self, input: OnsetInput) -> Message<LAYER_COUNT> {
         if !matches!(input, OnsetInput::Loop { .. })
-            && matches!(self.buffer.onset[0], Some(OnsetInput::Hold { .. }))
-            && !matches!(self.input_state.event, OnsetEvent::Loop { .. })
+            && matches!(self.buffer.onsets[self.layer as usize][0], Some(OnsetInput::Hold { .. } | OnsetInput::Loop { .. }))
         {
-            self.buffer.onset[1] = Some(input.clone());
+            // buffer rapid Stop or Hold event to next tick so the input doesn't seem to disappear
+            self.buffer.onsets[self.layer as usize][1] = Some(input);
         } else {
-            self.buffer.onset[0] = Some(input.clone());
+            self.buffer.onsets[self.layer as usize][0] = Some(input);
         }
-        self.cumulative_mod()
+        self.pass_net()
     }
 
-    /// returned `ModState` should be sent to `SignalHandler`
-    pub fn push_state(&mut self, input: StateInput) -> ModState<OnsetEvent<Onset>> {
-        match input {
-            StateInput::Reverse(v) => self.buffer.reverse = Some(v),
-        }
-        self.cumulative_mod()
+    pub fn push_phrase(&mut self, input: PhraseInput) -> Message<LAYER_COUNT> {
+        self.buffer.phrases[self.layer as usize] = Some(input);
+        self.pass_net()
     }
 
-    /// returned `ModState` should be sent to `SignalHandler`
-    pub fn push_phrase(&mut self, input: PhraseInput) -> ModState<OnsetEvent<Onset>> {
-        match input {
-            PhraseInput::Push { index } | PhraseInput::Pop { index } => self.buffer.phrase.retain(|e| match e {
-                PhraseInput::Push { index: i } | PhraseInput::Pop { index: i } => *i != index,
-            }),
-        }
-        self.buffer.phrase.push(input);
-        self.cumulative_mod()
-    }
-
-    /// returned `ModState` should be sent to `SignalHandler`
-    pub fn push_record(&mut self, input: RecordInput) -> ModState<OnsetEvent<Onset>> {
+    pub fn push_record(&mut self, input: RecordInput) -> Message<LAYER_COUNT> {
         self.buffer.record = Some(input);
-        self.cumulative_mod()
+        self.pass_net()
     }
 
-    /// returned `ModState` should be sent to `SignalHandler`
-    pub fn push_speed_ramp(&mut self, start: Option<f32>, delta: Option<f32>) -> ModState<OnsetEvent<Onset>> {
-        if let Some(delta) = delta {
-            self.ramp.delta = delta;
-        } else if let Some(start) = start {
-            self.ramp.speed = start;
-        }
-        self.cumulative_mod()
+    pub fn set_gain(&mut self, value: f32) -> Message<LAYER_COUNT> {
+        self.gain_ramp.value = value + 1.;
+        self.pass_net()
+    }
+
+    pub fn ramp_gain(&mut self, delta: f32) -> Message<LAYER_COUNT> {
+        self.gain_ramp.delta = delta / self.ticks_per_beat as f32;
+        self.pass_net()
+    }
+
+    pub fn set_pitch(&mut self, value: f32) -> Message<LAYER_COUNT> {
+        self.pitch_ramp.value = self.pitch_interval.powf(value);
+        self.pass_net()
+    }
+
+    pub fn ramp_pitch(&mut self, delta: f32) -> Message<LAYER_COUNT> {
+        self.pitch_ramp.delta = delta / self.ticks_per_beat as f32;
+        self.pass_net()
+    }
+
+    pub fn set_ticks_per_beat(&mut self, value: u32) -> Message<LAYER_COUNT> {
+        self.ticks_per_beat = value.max(1);
+        self.pass_net()
+    }
+
+    pub fn set_ticks_per_input(&mut self, value: u32) -> Message<LAYER_COUNT> {
+        self.ticks_per_input = value.max(1);
+        self.ticks_per_step = self.ticks_per_step.max(self.ticks_per_input);
+        self.pass_net()
+    }
+
+    pub fn set_ticks_per_step(&mut self, value: u32) -> Message<LAYER_COUNT> {
+        self.ticks_per_step = value.max(self.ticks_per_input);
+        self.pass_net()
+    }
+
+    pub fn set_steps_per_meas(&mut self, value: u32) -> Message<LAYER_COUNT> {
+        self.steps_per_meas = value.max(1);
+        self.pass_net()
     }
 
     pub fn set_record_mask(&mut self, mask: &[u8]) {
@@ -609,236 +713,122 @@ where
         self.phrase_writer.store_index = 0;
     }
 
+    /// for display purposes in external impl
+    pub fn get_ticks_per_step(&self) -> u32 {
+        self.ticks_per_step
+    }
+
+    /// for display purposes in external impl
+    pub fn get_ticks_per_beat(&self) -> u32 {
+        self.ticks_per_beat
+    }
+
+    /// for display purposes in external impl
     pub fn get_record_mask(&self) -> &[u8] {
         &self.phrase_writer.store_mask
     }
 
-    fn top_reader(&self) -> Option<&PhraseReader> {
-        self.phrase_stack.iter().rev().find(|r| self.phrases[r.index as usize].is_some())
-    }
-
     /// for display purposes in external impl
     pub fn get_reader_tick(&self, index: u8) -> Option<u32> {
-        self.phrase_stack.iter().rev().find(|r| r.index == index).map(|r| r.tick)
+        self.active_phrases.iter().flatten().find(|r| r.index == index).map(|r| r.tick)
     }
 
-    fn flush_speed(&mut self) {
-        self.buffer.speed = Some(self.ramp.speed);
-    }
+    // /// should be called before `StateHandler::tick`
+    // pub fn set_phrase_start(&mut self, input: u32) {
+    //     if let Some(reader) = &self.active_phrases[self.layer as usize] {
+    //         let Phrase { start, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
+    //         match self.phrase_snap_start {
+    //             Snap::Micro => *start = input * self.ticks_per_step,
+    //             Snap::Macro => *start = input * self.ticks_per_step * self.steps_per_meas,
+    //         }
+    //     }
+    // }
 
-    fn flush_phrase(&mut self) {
-        for event in self.buffer.phrase.drain(..).rev() {
-            match event {
-                PhraseInput::Push { index } => if self.phrases[index as usize].is_some() {
-                    self.phrase_stack.retain(|r| r.index != index);
-                    let _ = self.phrase_stack.push(PhraseReader { index, tick: 0 });
+    // /// should be called before `StateHandler::tick`
+    // pub fn set_phrase_len(&mut self, input: u32) {
+    //     if let Some(reader) = &self.active_phrases[self.layer as usize] {
+    //         let Phrase { len, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
+    //         match self.phrase_snap_len {
+    //             Snap::Micro => *len = input * self.ticks_per_step,
+    //             Snap::Macro => *len = input * self.ticks_per_step * self.steps_per_meas,
+    //         }
+    //     }
+    // }
+
+    /// should be called before `StateHandler::tick`
+    pub fn mod_phrase_start(&mut self, delta: i32) {
+        if let Some(reader) = &self.active_phrases[self.layer as usize] {
+            let Phrase { events, start, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
+            match self.phrase_snap_start {
+                Snap::Micro => {
+                    let scale = self.ticks_per_step as i32;
+                    *start = ((*start as i32 + delta * scale) / scale * scale).rem_euclid(PHRASE_LEN as i32) as u32;
                 }
-                PhraseInput::Pop { index } => self.phrase_stack.retain(|r| r.index != index),
-            }
-        }
-    }
-
-    fn flush_record(&mut self) {
-        if let Some(event) = self.buffer.record.take() {
-            match event {
-                RecordInput::Start => self.phrase_writer.try_start(),
-                RecordInput::Store => {
-                    if let Some(phrase) = self.phrase_writer.try_store(self.ticks_per_input) && let Some(store_to) = self.phrase_writer.try_advance() {
-                        self.phrases[store_to as usize] = Some(phrase);
-                        let delta_start = if matches!(self.phrase_writer.snap_start, Snap::Onset) {
-                            1
-                        } else {
-                            0
-                        };
-                        let delta_len = if matches!(self.phrase_writer.snap_len, Snap::Onset) {
-                            -1
-                        } else {
-                            0
-                        };
-                        self.mod_phrase_start(store_to, delta_start, self.phrase_writer.snap_start);
-                        self.mod_phrase_len(store_to, delta_len, self.phrase_writer.snap_len);
-                        let _ = self.push_phrase(PhraseInput::Push { index: store_to });
-                        self.ramp.speed = 1.;
-                    }
-                },
-            }
-        }
-    }
-
-    /// call from `SignalHandler` every tick
-    /// pass_input should be true at tick.rem_euclid(ticks_per_input - 1) == 0
-    /// returned `ModState` should be sent to `SignalHandler`
-    pub fn tick(&mut self, tick: i32, active_state: State<()>, active_mod: ModState<OnsetEvent<()>>) -> ModState<OnsetEvent<Onset>> {
-        self.active_state = active_state;
-        // advance ramp
-        if match self.ramp.snap {
-            Snap::Tick => true,
-            Snap::Beat => (tick + 1).rem_euclid(self.ticks_per_beat as i32) == 0,
-            Snap::Input => (tick + 1).rem_euclid(self.ticks_per_input as i32) == 0,
-            Snap::Onset => active_mod.event.as_ref().is_some_and(|e| matches!(e, OnsetEvent::Sync)),
-        } {
-            self.ramp.advance_speed();
-        }
-        // advance other
-        let pass_input = (tick + 1).rem_euclid(self.ticks_per_input as i32) == 0;
-        if pass_input {
-            // rising edge; before input tick
-            self.flush_record();
-            self.flush_phrase();
-        } else if self.pass_input {
-            // falling edge; after input tick
-            // FIXME: is it an issue that this buffer.onset eevnt may not be that received by SignalHandler?
-            if let Some(event) = self.buffer.onset[0].take() {
-                self.input_state.event = self.active_state.event.trans(event);
-            }
-            if let Some(reverse) = self.buffer.reverse.take() { self.input_state.reverse = reverse }
-            if let Some(speed) = self.buffer.speed.take() { self.input_state.speed = speed }
-        }
-        self.pass_input = pass_input;
-        self.phrase_writer.push(active_mod);
-        if let WriterState::Recording { len, .. } = &mut self.phrase_writer.state { *len += 1 }
-        let tick_delta = self.tick_delta();
-        for reader in self.phrase_stack.iter_mut() {
-            if let Some(Phrase { len, .. }) = &self.phrases[reader.index as usize] {
-                reader.tick = (reader.tick as i32 + tick_delta).rem_euclid(*len as i32) as u32;
-            }
-        }
-        self.cumulative_mod()
-    }
-
-    /// to prevent `PhraseReader`s from reversing their own playback (and how would that interact with
-    /// `Record`?), `tick_delta` is dependent only on direct user input
-    fn tick_delta(&self) -> i32 {
-        if self.input_state.reverse {
-            -1
-        } else {
-            1
-        }
-    }
-
-    pub fn set_record_start_snap(&mut self, snap: Snap) {
-        self.phrase_writer.snap_start = snap;
-    }
-
-    pub fn set_record_len_snap(&mut self, snap: Snap) {
-        self.phrase_writer.snap_len = snap;
-    }
-
-    pub fn set_ramp_snap(&mut self, snap: Snap) {
-        self.ramp.snap = snap;
-    }
-
-    /// should be called before `StateHandler::tick`
-    pub fn set_active_phrase_start(&mut self, input: u32, snap: Snap) {
-        if let Some(reader) = self.top_reader() {
-            let Phrase { start, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
-            match snap {
-                Snap::Tick => *start = input,
-                Snap::Beat => *start = input * self.ticks_per_beat,
-                Snap::Input => *start = input * self.ticks_per_input,
-                Snap::Onset => (),
-            }
-        }
-    }
-
-    /// should be called before `StateHandler::tick`
-    pub fn set_active_phrase_len(&mut self, input: u32, snap: Snap) {
-        if let Some(reader) = self.top_reader() {
-            let Phrase { len, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
-            match snap {
-                Snap::Tick => *len = input,
-                Snap::Beat => *len = input * self.ticks_per_beat,
-                Snap::Input => *len = input * self.ticks_per_input,
-                Snap::Onset => (),
-            }
-        }
-    }
-
-    fn mod_phrase_start(&mut self, index: u8, delta: i32, snap: Snap) {
-        let Phrase { states, start, .. } = self.phrases[index as usize].as_mut().unwrap();
-        match snap {
-            Snap::Tick => *start = (*start as i32 + delta).rem_euclid(PHRASE_LEN as i32) as u32,
-            Snap::Beat => *start = ((*start as i32 + delta * self.ticks_per_beat as i32) / self.ticks_per_beat as i32 * self.ticks_per_beat as i32).rem_euclid(PHRASE_LEN as i32) as u32,
-            Snap::Input => *start = ((*start as i32 + delta * self.ticks_per_input as i32) / self.ticks_per_input as i32 * self.ticks_per_input as i32).rem_euclid(PHRASE_LEN as i32) as u32,
-            Snap::Onset => {
-                if delta == 0 { return; }
-                if delta.is_negative() && let Some((delta, _)) = states
-                    .iter()
-                    .rev()
-                    .cycle()
-                    .skip((-(*start as i32) + 1).rem_euclid(PHRASE_LEN as i32) as usize)
-                    .enumerate()
-                    .filter(|(_, s)| s.event.as_ref().is_some_and(|s| !matches!(s, OnsetEvent::Sync)))
-                    .nth(delta.unsigned_abs() as usize - 1)
-                {
-                    *start = (*start as i32 - delta as i32 - 2).rem_euclid(PHRASE_LEN as i32) as u32;
-                } else if let Some((delta, _)) = states
-                    .iter()
-                    .cycle()
-                    .skip(*start as usize + 1)
-                    .enumerate()
-                    .filter(|(_, s)| s.event.as_ref().is_some_and(|e| !matches!(e, OnsetEvent::Sync)))
-                    .nth(delta as usize - 1)
-                {
-                    *start = (*start + delta as u32 + 1).rem_euclid(PHRASE_LEN as u32);
-                }
-            }
-        };
-    }
-
-    /// should be called before `StateHandler::tick`
-    pub fn mod_active_phrase_start(&mut self, delta: i32, snap: Snap) {
-        if let Some(reader) = self.top_reader() {
-            self.mod_phrase_start(reader.index, delta, snap);
-        }
-    }
-
-    fn mod_phrase_len(&mut self, index: u8, delta: i32, snap: Snap) {
-        let Phrase { states, start, len } = self.phrases[index as usize].as_mut().unwrap();
-        match snap {
-            Snap::Tick => {
-                let new = *len as i32 + delta;
-                if new > 0 { *len = new as u32 }
-            }
-            Snap::Beat => {
-                let new = (*len as i32 + delta * self.ticks_per_beat as i32) / self.ticks_per_beat as i32 * self.ticks_per_beat as i32;
-                if new > 0 { *len = new as u32 }
-            }
-            Snap::Input => {
-                let new = (*len as i32 + delta * self.ticks_per_input as i32) / self.ticks_per_input as i32 * self.ticks_per_input as i32;
-                if new > 0 { *len = new as u32 }
-            }
-            Snap::Onset => {
-                if delta == 0 { return; }
-                if delta.is_negative() && let Some((delta, _)) = states
-                    .iter()
-                    .rev()
-                    .cycle()
-                    .skip((-((*start + *len) as i32) + 1).rem_euclid(PHRASE_LEN as i32) as usize)
-                    .enumerate()
-                    .filter(|(_, s)| s.event.as_ref().is_some_and(|s| !matches!(s, OnsetEvent::Sync)))
-                    .nth(delta.unsigned_abs() as usize - 1)
-                {
-                    let new = *len as i32 - delta as i32 - 2;
-                    if new > 0 { *len = new as u32 }
-                } else if let Some((delta, _)) = states
-                    .iter()
-                    .cycle()
-                    .skip((*start + *len) as usize + 1)
-                    .enumerate()
-                    .filter(|(_, s)| s.event.as_ref().is_some_and(|e| !matches!(e, OnsetEvent::Sync)))
-                    .nth(delta as usize - 1)
-                {
-                    *len = *len + delta as u32 + 1;
+                Snap::Macro => {
+                    let scale = self.ticks_per_step as i32 * self.steps_per_meas as i32;
+                    *start = ((*start as i32 + delta * scale) / scale * scale).rem_euclid(PHRASE_LEN as i32) as u32;
+                    // if delta == 0 { return; }
+                    // if delta.is_negative() && let Some((delta, _)) = events
+                    //     .iter()
+                    //     .rev()
+                    //     .cycle()
+                    //     .skip((-(*start as i32) + 1).rem_euclid(PHRASE_LEN as i32) as usize)
+                    //     .enumerate()
+                    //     .filter(|(_, m)| m.inner.as_ref().is_some_and(|e| !matches!(e, OnsetEvent::Stop)))
+                    //     .nth(delta.unsigned_abs() as usize - 1)
+                    // {
+                    //     *start = (*start as i32 - delta as i32 - 2).rem_euclid(PHRASE_LEN as i32) as u32;
+                    // } else if let Some((delta, _)) = events
+                    //     .iter()
+                    //     .cycle()
+                    //     .skip(*start as usize + 1)
+                    //     .enumerate()
+                    //     .filter(|(_, m)| m.inner.as_ref().is_some_and(|e| !matches!(e, OnsetEvent::Stop)))
+                    //     .nth(delta as usize - 1)
+                    // {
+                    //     *start = (*start + delta as u32 + 1).rem_euclid(PHRASE_LEN as u32);
+                    // }
                 }
             }
         }
     }
 
     /// should be called before `StateHandler::tick`
-    pub fn mod_active_phrase_len(&mut self, delta: i32, snap: Snap) {
-        if let Some(reader) = self.top_reader() {
-            self.mod_phrase_len(reader.index, delta, snap);
+    pub fn mod_phrase_len(&mut self, delta: i32) {
+        if let Some(reader) = &self.active_phrases[self.layer as usize] {
+            let Phrase { events, start, len } = self.phrases[reader.index as usize].as_mut().unwrap();
+            match self.phrase_snap_len {
+                Snap::Micro => {
+                    let scale = self.ticks_per_step as i32;
+                    *len = (((*len as i32 + delta * scale) / scale).max(1) * scale) as u32;
+                }
+                Snap::Macro => {
+                    let scale = self.ticks_per_step as i32 * self.steps_per_meas as i32;
+                    *len = (((*len as i32 + delta * scale) / scale).max(1) * scale) as u32;
+                    // if delta == 0 { return; }
+                    // if delta.is_negative() && let Some((delta, _)) = events
+                    //     .iter()
+                    //     .rev()
+                    //     .cycle()
+                    //     .skip((-((*start + *len) as i32) + 1).rem_euclid(PHRASE_LEN as i32) as usize)
+                    //     .enumerate()
+                    //     .filter(|(_, m)| m.inner.as_ref().is_some_and(|e| !matches!(e, OnsetEvent::Stop)))
+                    //     .nth(delta.unsigned_abs() as usize - 1)
+                    // {
+                    //     let new = *len as i32 - delta as i32 - 2;
+                    //     if new > 0 { *len = new as u32 }
+                    // } else if let Some((delta, _)) = events
+                    //     .iter()
+                    //     .cycle()
+                    //     .skip((*start + *len) as usize + 1)
+                    //     .enumerate()
+                    //     .filter(|(_, m)| m.inner.as_ref().is_some_and(|e| !matches!(e, OnsetEvent::Stop)))
+                    //     .nth(delta as usize - 1)
+                    // {
+                    //     *len = *len + delta as u32 + 1;
+                    // }
+                }
+            }
         }
     }
 }

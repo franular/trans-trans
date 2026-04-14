@@ -28,7 +28,7 @@ impl super::App {
         }
         let [num_area] = num_area.layout(&Layout::horizontal([Constraint::Fill(1)]).horizontal_margin(14));
         help.render(help_area, buf);
-        let string = self.num_buffer.num.to_string() + " " + &self.num_buffer.snap.to_string();
+        let string = self.num_buffer.num.to_string();
         ratatui::widgets::Block::new().title(string.to_line().right_aligned().patch_style(WEAK)).render(num_area, buf);
     }
 
@@ -40,7 +40,7 @@ impl super::App {
         ]));
         let area = area.centered_horizontally(Constraint::Length(7 * input::PHRASE_COUNT as u16 - 1));
         let areas: [_; input::PHRASE_COUNT] = area.layout(&Layout::horizontal([Constraint::Length(6); input::PHRASE_COUNT]).spacing(1));
-        let mask = self.state_handler.get_record_mask();
+        let mask = &self.state_handler.get_record_mask();
         for (i, area) in areas.into_iter().enumerate() {
             let masked = mask.contains(&(i as u8));
             let mut block = ratatui::widgets::Block::new().style(BG);
@@ -74,7 +74,11 @@ impl Widget for &input::App {
 
 impl Widget for &input::Throbber {
     fn render(self, area: ratatui::prelude::Rect, buf: &mut ratatui::prelude::Buffer) {
-        let throbber_area = area.centered_vertically(Constraint::Length(3)).centered_horizontally(Constraint::Length(6));
+        let area = area.centered_horizontally(Constraint::Length(6));
+        let [step_area, throbber_area] = area.layout(&Layout::vertical([Constraint::Length(1),Constraint::Length(3)]).flex(ratatui::layout::Flex::Center));
+        ratatui::widgets::Paragraph::new(
+            ratatui::text::Text::from((self.step + 1).to_string()),
+        ).set_style(WEAK).render(step_area, buf);
         if self.high {
             ratatui::widgets::Block::new().style(BG).render(throbber_area, buf);
         } else {
