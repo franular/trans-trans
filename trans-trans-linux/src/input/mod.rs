@@ -525,7 +525,7 @@ impl App {
     }
 
     fn push_kit(&mut self, bank: u8, index: u8) {
-        self.state_handler.kit_indices[bank as usize] = index;
+        self.state_handler.set_kit_index(bank, index);
     }
 
     fn set_legato(&mut self, value: bool) -> Result<()> {

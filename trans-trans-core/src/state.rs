@@ -380,7 +380,7 @@ pub struct Kit<const KIT_LEN: usize> {
 pub struct StateHandler<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, const KIT_LEN: usize, const PHRASE_COUNT: usize, const PHRASE_LEN: usize> {
     pub layer: u8,
     pub kits: [Option<Kit<KIT_LEN>>; KIT_COUNT],
-    pub kit_indices: [u8; BANK_COUNT],
+    kit_indices: [[u8; BANK_COUNT]; LAYER_COUNT],
 
     pub phrases: [Option<Phrase<PHRASE_LEN>>; PHRASE_COUNT],
     pub phrase_writer: PhraseWriter<PHRASE_COUNT, PHRASE_LEN>,
@@ -420,7 +420,7 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         Self {
             layer: 0,
             kits: core::array::from_fn(|_| None),
-            kit_indices: [0; BANK_COUNT],
+            kit_indices: [[0; BANK_COUNT]; LAYER_COUNT],
 
             phrases: core::array::from_fn(|_| None),
             phrase_writer: PhraseWriter::default(),
@@ -529,7 +529,7 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
             if let Some(input) = input_onset[0].clone() {
                 *active_onset = match input {
                     OnsetInput::Stop => OnsetEvent::Stop,
-                    OnsetInput::Hold { index } => if let Some(onset) = self.kits[self.kit_indices[index as usize * BANK_COUNT / KIT_LEN] as usize].as_ref().and_then(|k| k.onsets[index as usize].as_ref()) {
+                    OnsetInput::Hold { index } => if let Some(onset) = self.kits[self.kit_indices[l][index as usize * BANK_COUNT / KIT_LEN] as usize].as_ref().and_then(|k| k.onsets[index as usize].as_ref()) {
                         let tick = if let OnsetEvent::Loop { tick, index: i, .. } = active_onset && *i == index {
                             *tick
                         } else {
@@ -548,7 +548,7 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
                     } else {
                         OnsetEvent::Stop
                     }
-                    OnsetInput::Loop { index, len } => if let Some(onset) = self.kits[self.kit_indices[index as usize * BANK_COUNT / KIT_LEN] as usize].as_ref().and_then(|k| k.onsets[index as usize].as_ref()) {
+                    OnsetInput::Loop { index, len } => if let Some(onset) = self.kits[self.kit_indices[l][index as usize * BANK_COUNT / KIT_LEN] as usize].as_ref().and_then(|k| k.onsets[index as usize].as_ref()) {
                         let tick = if let OnsetEvent::Hold { tick, index: i, .. } | OnsetEvent::Loop { tick, index: i, .. } = active_onset && *i == index {
                             tick.rem_euclid(len as i32)
                         } else {
@@ -711,6 +711,10 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         mask.sort();
         self.phrase_writer.store_mask = mask;
         self.phrase_writer.store_index = 0;
+    }
+
+    pub fn set_kit_index(&mut self, bank: u8, index: u8) {
+        self.kit_indices[self.layer as usize][bank as usize] = index;
     }
 
     /// for display purposes in external impl
