@@ -110,13 +110,13 @@ impl GrainReader {
         let index_a = (index.floor() as i64 + buffer.len() as i64 / 2) as usize;
         let sample_a = buffer[index_a] as f32 / i16::MAX as f32;
         let sample_b = buffer[index_a + 1] as f32 / i16::MAX as f32;
-        sample_a * (index.ceil() - index) + sample_b * (index - index.floor())
+        sample_a * (1. + index.floor() - index) + sample_b * (index - index.floor())
     }
 
     /// pan ranges from 0. (full left) to 1. (full right)
     fn mixdown_sample(sample: f32, pan: f32, gain: f32) -> (f32, f32) {
-        let l = f32::tanh(sample * gain * (1. - pan));
-        let r = f32::tanh(sample * gain * pan);
+        let l = sample * gain * (1. - pan);
+        let r = sample * gain * pan;
         (l, r)
     }
 
@@ -132,7 +132,7 @@ impl GrainReader {
                 window_index: 0,
                 onset_data: Some((onset.inner.sample_rate, onset.mods.clone())),
             });
-            let seek_to = onset.inner.pos(fs)? as i64 + self.grain_index.floor() as i64 * 2 - GRAIN_LEN as i64 * 4;
+            let seek_to = onset.inner.pos(fs)? as i64 + (self.grain_index.floor() as i64 - FADE_LEN as i64) * 2;
             onset.inner.seek(seek_to, fs)?;
             let bytes = bytemuck::cast_slice_mut(&mut self.fade);
             onset.inner.read(bytes, fs)?;
@@ -218,12 +218,13 @@ impl GrainReader {
             } else {
                 (0., 0.)
             }
+            // grain_sample = window;
         } else {
             (0., 0.)
         };
         let (gl, gr) = if let Some(mods) = grain_mods {
             Self::mixdown_sample(grain_sample, mods.pan, mods.gain)
-            } else {
+        } else {
             (0., 0.)
         };
         (fl + gl, fr + gr)

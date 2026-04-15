@@ -53,22 +53,16 @@ impl<F: FileHandler> Onset<F> {
     }
 }
 
-pub struct SignalHandler<const LAYER_COUNT: usize, F: FileHandler>
-where
-    [(); LAYER_COUNT + 1]:,
-{
-    grains: [GrainReader; LAYER_COUNT + 1],
+pub struct SignalHandler<const LAYER_COUNT: usize, F: FileHandler> {
+    grains: [GrainReader; LAYER_COUNT],
     pub tick: f32,
     pub tempo: f32,
     ticks_per_beat: u32,
     ticks_per_meas: u32,
-    active_events: [state::OnsetEvent<state::Modded<Onset<F>>>; LAYER_COUNT + 1],
+    active_events: [state::OnsetEvent<state::Modded<Onset<F>>>; LAYER_COUNT],
 }
 
-impl<const LAYER_COUNT: usize, F: FileHandler> SignalHandler<LAYER_COUNT, F>
-where
-    [(); LAYER_COUNT + 1]:,
-{
+impl<const LAYER_COUNT: usize, F: FileHandler> SignalHandler<LAYER_COUNT, F> {
     pub fn new(tempo: f32, ticks_per_beat: u32, ticks_per_input: u32, ticks_per_step: u32, steps_per_meas: u32) -> Self {
         Self {
             grains: core::array::from_fn(|_| GrainReader::default()),
@@ -86,16 +80,16 @@ where
         // FIXME: support alternative channels counts
         assert!(channels == 2, "currently only stereo output is supported");
         for i in 0..buffer.len() / channels {
-            for idx in 0..LAYER_COUNT + 1 {
-                let (l, r) = self.grains[idx].read::<ONSET_COUNT, F>(
-                    &mut self.active_events[idx],
+            for l in 0..LAYER_COUNT {
+                let (l, r) = self.grains[l].read::<ONSET_COUNT, F>(
+                    &mut self.active_events[l],
                     sample_rate,
                     fs,
                 )?;
                 buffer[i * channels] += l;
                 buffer[i * channels + 1] += r;
             }
-            // apply equal compression to all channels
+            // apply equal compression to all channels:
             let mult = f32::min(
                 if buffer[i * channels] == 0. {
                     1.
@@ -113,28 +107,27 @@ where
             let tick_delta = self.ticks_per_beat as f32 * self.tempo / (60. * sample_rate as f32);
             if self.tick.ceil() != { self.tick += tick_delta; self.tick.ceil() } {
                 self.tick = self.tick.rem_euclid(self.ticks_per_meas as f32);
-                return Ok(Some(i * channels))
+                return Ok(Some((i + 1) * channels))
             }
         }
         Ok(None)
     }
 
-    pub fn tick(&mut self, mut message: state::Message<LAYER_COUNT>, fs: &mut F) -> Result<Message<LAYER_COUNT>, Error<F::Error>> {
+    pub fn tick(&mut self, message: state::Message<LAYER_COUNT>, fs: &mut F) -> Result<Message<LAYER_COUNT>, Error<F::Error>> {
         self.ticks_per_beat = message.ticks_per_beat;
         self.ticks_per_meas = message.ticks_per_meas;
-        for (local, rx) in self.active_events.iter_mut().zip(message.events.iter_mut()) {
-            // FIXME: get fades to not sound like shit please
-            // // fade every tick to account for sync, events, gain, etc., and on Stop
-            // if let state::OnsetEvent::Hold { onset, .. } | state::OnsetEvent::Loop { onset, .. } = local {
-            //     self.grain.fade::<LAYER_COUNT, F>(Some(onset), fs)?;
-            // } else if matches!(rx.inner, Some(state::OnsetEvent::Stop)) {
-            //     self.grain.fade::<LAYER_COUNT, F>(None, fs)?;
-            // }
+        for l in 0..LAYER_COUNT {
+            // fade every tick to account for sync, events, gain, etc., and on Stop
+            if let state::OnsetEvent::Hold { onset, .. } | state::OnsetEvent::Loop { onset, .. } = &mut self.active_events[l] {
+                self.grains[l].fade::<LAYER_COUNT, F>(Some(onset), fs)?;
+            } else if message.events[l].inner.is_some() {
+                self.grains[l].fade::<LAYER_COUNT, F>(None, fs)?;
+            }
             // replace event
-            let uninit: &mut MaybeUninit<state::OnsetEvent<state::Modded<Onset<F>>>> = unsafe { core::mem::transmute(&mut *local) };
+            let uninit: &mut MaybeUninit<state::OnsetEvent<state::Modded<Onset<F>>>> = unsafe { core::mem::transmute(&mut self.active_events[l]) };
             let mut temp = unsafe { core::mem::replace(uninit, MaybeUninit::uninit()).assume_init() };
-            temp = temp.tick(rx, self.ticks_per_beat, fs)?;
-            core::mem::swap(local, &mut temp);
+            temp = temp.tick(&message.events[l], self.ticks_per_beat, fs)?;
+            core::mem::swap(&mut self.active_events[l], &mut temp);
             core::mem::forget(temp);
         }
         Ok(Message { tick: self.tick.floor() as i32, inputs: message.inputs })

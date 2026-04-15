@@ -77,7 +77,7 @@ macro_rules! release {
     };
 }
 
-const INIT_PHRASE_SNAP_START: ttcore::Snap = ttcore::Snap::Macro;
+const INIT_PHRASE_SNAP_START: ttcore::Snap = ttcore::Snap::Micro;
 const INIT_PHRASE_SNAP_LEN: ttcore::Snap = ttcore::Snap::Macro;
 const INIT_PITCH_INTERVAL: f32 = 1.0594631;
 const INIT_RAMP_SNAP: ttcore::Snap = ttcore::Snap::Macro;
@@ -349,7 +349,8 @@ impl App {
     pub fn new(
         audio_tx: std::sync::mpsc::Sender<audio::Cmd>,
     ) -> Self {
-        let bytes0 = std::fs::read("kits/Small Faces - Rollin Over.ttk").unwrap();
+        // let bytes0 = std::fs::read("kits/Small Faces - Rollin Over.ttk").unwrap();
+        let bytes0 = std::fs::read("kits/b4.ttk").unwrap();
         let bytes1 = std::fs::read("kits/face a.ttk").unwrap();
         let bytes2 = std::fs::read("kits/Dennis Coffey - Scorpio (cd).ttk").unwrap();
         let bytes3 = std::fs::read("kits/James Brown - Cold Sweat (ver.2).ttk").unwrap();
