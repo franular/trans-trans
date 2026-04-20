@@ -120,7 +120,7 @@ impl GrainReader {
         (l, r)
     }
 
-    pub fn fade<const ONSET_COUNT: usize, F: FileHandler>(
+    pub fn fade<F: FileHandler>(
         &mut self,
         onset: Option<&mut state::Modded<signal::Onset<F>>>,
         fs: &mut F,
@@ -153,7 +153,7 @@ impl GrainReader {
         &mut self,
         onset: &mut signal::Onset<F>,
         fs: &mut F,
-    ) -> Result<(), F::Error> {
+    ) -> Result<bool, F::Error> {
         if let Some(FadeState { ready, .. }) = self.fade_state.as_mut() && !*ready {
             *ready = true;
             let next_center = onset.pos(fs)? as i64;
@@ -170,7 +170,7 @@ impl GrainReader {
             onset.seek(next_center, fs)?; // recenter pos() for next read
             self.grain_index -= self.grain_index.floor();
         }
-        Ok(())
+        Ok(false)
     }
 
     fn advance_indices<F: FileHandler>(
@@ -223,7 +223,11 @@ impl GrainReader {
             (0., 0.)
         };
         let (gl, gr) = if let Some(mods) = grain_mods {
-            Self::mixdown_sample(grain_sample, mods.pan, mods.gain)
+            Self::mixdown_sample(
+                grain_sample,
+                mods.pan,
+                mods.gain,
+            )
         } else {
             (0., 0.)
         };

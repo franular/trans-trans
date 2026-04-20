@@ -56,18 +56,23 @@ impl<const LAYER_COUNT: usize> Default for Buffer<LAYER_COUNT> {
 
 struct Ramp {
     tick: u32,
-    value: f32,
+    base: f32,
+    mult: f32,
     delta: f32,
 }
 
 impl Ramp {
-    fn new(value: f32, delta: f32) -> Self {
-        Ramp { tick: 0, value, delta }
+    fn new() -> Self {
+        Ramp { tick: 0, base: 1., mult: 1., delta: 0. }
     }
 
     fn advance(&mut self, advance_fn: impl Fn(f32, f32) -> f32) {
-        self.value = advance_fn(self.value, self.delta * self.tick as f32);
+        self.mult = advance_fn(self.mult, self.delta * self.tick as f32);
         self.tick = 0;
+    }
+
+    fn net(&self) -> f32 {
+        self.base * self.mult
     }
 }
 
@@ -142,13 +147,24 @@ impl<F: FileHandler> OnsetEvent<Modded<signal::Onset<F>>> {
             None => match self {
                 OnsetEvent::Stop => Ok(OnsetEvent::Stop),
                 OnsetEvent::Hold { mut tick, mut onset, index, .. } => {
-                    tick += 1;
+                    tick += if to.mods.reverse { -1 } else { 1 };
+                    if onset.inner.onset_start.is_none()
+                        && !(0..(onset.inner.beat_count * ticks_per_beat) as i32).contains(&tick)
+                    {
+                        return Ok(OnsetEvent::Stop);
+                    }
                     onset.inner.seek_from_start(tick, ticks_per_beat, fs)?;
                     onset.mods = to.mods.clone();
                     Ok(OnsetEvent::Hold { tick, onset, index })
                 }
                 OnsetEvent::Loop { mut tick, mut onset, index, len, .. } => {
-                    tick = (tick + 1).rem_euclid(len as i32);
+                    tick += if to.mods.reverse { -1 } else { 1 };
+                    if tick >= len as i32 {
+                        if onset.inner.onset_start.is_none() {
+                            return Ok(OnsetEvent::Stop);
+                        }
+                        tick = tick.rem_euclid(len as i32);
+                    }
                     onset.inner.seek_from_start(tick, ticks_per_beat, fs)?;
                     onset.mods = to.mods.clone();
                     Ok(OnsetEvent::Loop { tick, onset, index, len })
@@ -206,7 +222,7 @@ impl<const LAYER_COUNT: usize> Default for Message<LAYER_COUNT> {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Onset {
     pub path: String,
-    pub onset_start: u32,
+    pub onset_start: Option<u32>,
     pub beat_count: u32,
 }
 
@@ -393,9 +409,10 @@ pub struct StateHandler<const BANK_COUNT: usize, const LAYER_COUNT: usize, const
 
     pub pitch_interval: f32,
     pub ramp_snap: Snap,
-    gain_ramps: [Ramp; PHRASE_COUNT],
-    pitch_ramps: [Ramp; PHRASE_COUNT],
-    pub reverse: bool,
+    gain_ramps: [Ramp; LAYER_COUNT],
+    pitch_ramps: [Ramp; LAYER_COUNT],
+    widths: [f32; LAYER_COUNT],
+    reverse: bool,
 
     pass_input: bool,
     ticks_per_input: u32,
@@ -433,8 +450,9 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
 
             pitch_interval,
             ramp_snap,
-            gain_ramps: core::array::from_fn(|_| Ramp::new(1., 0.)),
-            pitch_ramps: core::array::from_fn(|_| Ramp::new(1., 0.)),
+            gain_ramps: core::array::from_fn(|_| Ramp::new()),
+            pitch_ramps: core::array::from_fn(|_| Ramp::new()),
+            widths: [1.; LAYER_COUNT],
             reverse: false,
             
             pass_input: false,
@@ -468,15 +486,17 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
             if matches!(input_onset[0], Some(OnsetInput::Stop)) && let Some(phrase) = active_phrase {
                 // output synced active phrase, if any
                 let Phrase { events, start, len } = &self.phrases[phrase.index as usize].as_ref().unwrap();
-                let mut tick_offset = 0;
+                let mut phrase_tick_offset = 0;
+                let mut onset_tick_offset = 0;
                 let s_index = |tick: i32| (*start as i32 + (phrase.tick as i32 - tick).rem_euclid(*len as i32)).rem_euclid(PHRASE_LEN as i32) as usize;
-                while tick_offset < *len as i32 && matches!(events[s_index(tick_offset)].inner, None | Some(OnsetEvent::Stop)) {
-                    tick_offset += 1;
+                while onset_tick_offset < *len as i32 && matches!(events[s_index(phrase_tick_offset)].inner, None | Some(OnsetEvent::Stop)) {
+                    phrase_tick_offset += 1;
+                    onset_tick_offset += if events[s_index(phrase_tick_offset)].mods.reverse { -1 } else { 1 };
                 }
-                let mut e = events[s_index(tick_offset)].inner.clone();
+                let mut e = events[s_index(onset_tick_offset)].inner.clone();
                 match e {
-                    Some(OnsetEvent::Hold { ref mut tick, .. }) => *tick += tick_offset,
-                    Some(OnsetEvent::Loop { ref mut tick, len, .. }) => *tick = (*tick + tick_offset).rem_euclid(len as i32),
+                    Some(OnsetEvent::Hold { ref mut tick, .. }) => *tick += onset_tick_offset,
+                    Some(OnsetEvent::Loop { ref mut tick, len, .. }) => *tick = (*tick + onset_tick_offset).rem_euclid(len as i32),
                     _ => (),
                 }
                 *net = Modded { inner: e, mods: events[(start + phrase.tick) as usize % PHRASE_LEN].mods.clone() };
@@ -538,9 +558,9 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
                         let onset = Modded {
                             inner: onset.clone(),
                             mods: Mods {
-                                pan: index as f32 / (KIT_LEN - 1) as f32,
-                                gain: self.gain_ramps[l].value,
-                                speed: self.pitch_ramps[l].value,
+                                pan: ((index as f32 / (KIT_LEN - 1) as f32) - 0.5) * self.widths[l] + 0.5,
+                                gain: self.gain_ramps[l].net(),
+                                speed: self.pitch_ramps[l].net(),
                                 reverse: self.reverse,
                             },
                         };
@@ -557,9 +577,9 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
                         let onset = Modded {
                             inner: onset.clone(),
                             mods: Mods {
-                                pan: index as f32 / (KIT_LEN - 1) as f32,
-                                gain: self.gain_ramps[l].value,
-                                speed: self.pitch_ramps[l].value,
+                                pan: ((index as f32 / (KIT_LEN - 1) as f32) - 0.5) * self.widths[l] + 0.5,
+                                gain: self.gain_ramps[l].net(),
+                                speed: self.pitch_ramps[l].net(),
                                 reverse: self.reverse,
                             },
                         };
@@ -606,10 +626,10 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         for l in 0..LAYER_COUNT {
             match self.active_onsets[l] {
                 OnsetEvent::Stop => (),
-                OnsetEvent::Hold { ref mut tick, .. } => *tick += 1,
-                OnsetEvent::Loop { ref mut tick, len, .. } => *tick = (*tick + 1).rem_euclid(len as i32),
+                OnsetEvent::Hold { ref mut tick, ref onset, .. } => *tick += if onset.mods.reverse { -1 } else { 1 },
+                OnsetEvent::Loop { ref mut tick, ref onset, len, .. } => *tick = (*tick + if onset.mods.reverse { -1 } else { 1 }).rem_euclid(len as i32),
             }
-            // flush ramps to top Modded
+            // flush ramps, width to Modded
             self.gain_ramps[l].tick += 1;
             self.pitch_ramps[l].tick += 1;
             if match self.ramp_snap {
@@ -627,9 +647,10 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
                     (v * self.pitch_interval.powf(d)).clamp(self.pitch_interval.powf(-16.), self.pitch_interval.powf(16.))
                 });
             }
-            if let OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } = &mut self.active_onsets[l] {
-                onset.mods.gain = self.gain_ramps[l].value;
-                onset.mods.speed = self.pitch_ramps[l].value;
+            if let OnsetEvent::Hold { ref mut onset, index, .. } | OnsetEvent::Loop { ref mut onset, index, .. } = self.active_onsets[l] {
+                onset.mods.pan = ((index as f32 / (KIT_LEN - 1) as f32) - 0.5) * self.widths[l] + 0.5;
+                onset.mods.gain = self.gain_ramps[l].net();
+                onset.mods.speed = self.pitch_ramps[l].net();
             }
         }
         self.try_pass();
@@ -644,6 +665,11 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
     }
 
     pub fn push_onset(&mut self, input: OnsetInput) -> Message<LAYER_COUNT> {
+        if matches!(input, OnsetInput::Stop)
+            && let OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } = &self.active_onsets[self.layer as usize]
+            && onset.inner.onset_start.is_none() {
+            return self.pass_net();
+        }
         if !matches!(input, OnsetInput::Loop { .. })
             && matches!(self.buffer.onsets[self.layer as usize][0], Some(OnsetInput::Hold { .. } | OnsetInput::Loop { .. }))
         {
@@ -665,8 +691,13 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         self.pass_net()
     }
 
-    pub fn set_gain(&mut self, value: f32) -> Message<LAYER_COUNT> {
-        self.gain_ramps[self.layer as usize].value = value + 1.;
+    pub fn base_gain(&mut self, value: f32, layer: u8) -> Message<LAYER_COUNT> {
+        self.gain_ramps[layer as usize].base = value + 1.;
+        self.pass_net()
+    }
+
+    pub fn mult_gain(&mut self, value: f32) -> Message<LAYER_COUNT> {
+        self.gain_ramps[self.layer as usize].mult = value + 1.;
         self.pass_net()
     }
 
@@ -675,13 +706,28 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         self.pass_net()
     }
 
-    pub fn set_pitch(&mut self, value: f32) -> Message<LAYER_COUNT> {
-        self.pitch_ramps[self.layer as usize].value = self.pitch_interval.powf(value);
+    pub fn base_pitch(&mut self, value: f32, layer: u8) -> Message<LAYER_COUNT> {
+        self.pitch_ramps[layer as usize].base = self.pitch_interval.powf(value);
+        self.pass_net()
+    }
+
+    pub fn mult_pitch(&mut self, value: f32) -> Message<LAYER_COUNT> {
+        self.pitch_ramps[self.layer as usize].mult = self.pitch_interval.powf(value);
         self.pass_net()
     }
 
     pub fn ramp_pitch(&mut self, delta: f32) -> Message<LAYER_COUNT> {
         self.pitch_ramps[self.layer as usize].delta = delta / self.ticks_per_beat as f32;
+        self.pass_net()
+    }
+
+    pub fn push_width(&mut self, value: f32, layer: u8) -> Message<LAYER_COUNT> {
+        self.widths[layer as usize] = value.clamp(0., 1.);
+        self.pass_net()
+    }
+
+    pub fn push_reverse(&mut self, value: bool) -> Message<LAYER_COUNT> {
+        self.reverse = value;
         self.pass_net()
     }
 

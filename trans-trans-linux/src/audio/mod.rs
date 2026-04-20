@@ -12,6 +12,7 @@ pub enum Cmd {
 pub struct AudioHandler {
     audio_rx: std::sync::mpsc::Receiver<Cmd>,
     input_tx: futures::channel::mpsc::UnboundedSender<input::Cmd>,
+    clock_tx: midir::MidiOutputConnection,
 
     signal_handler: ttcore::signal::SignalHandler<{input::LAYER_COUNT}, crate::fs::LinuxFileHandler>,
     fs: crate::fs::LinuxFileHandler,
@@ -21,6 +22,7 @@ impl AudioHandler {
     pub fn new(
         audio_rx: std::sync::mpsc::Receiver<Cmd>,
         input_tx: futures::channel::mpsc::UnboundedSender<input::Cmd>,
+        clock_tx: midir::MidiOutputConnection,
     ) -> Self {
         let signal_handler = ttcore::signal::SignalHandler::new(
             input::INIT_TEMPO,
@@ -32,6 +34,7 @@ impl AudioHandler {
         Self {
             audio_rx,
             input_tx,
+            clock_tx,
             signal_handler,
             fs: crate::fs::LinuxFileHandler {},
         }
@@ -44,17 +47,23 @@ impl AudioHandler {
     ) -> color_eyre::Result<()> {
         let mut slice = &mut data[..];
         while !slice.is_empty() {
-            if let Some(n) = self.signal_handler.read::<{input::LAYER_COUNT}>(slice, channels, SAMPLE_RATE, &mut self.fs)? {
-                let mut msg = ttcore::state::Message::default();
-                // flush buffered commands
-                for cmd in self.audio_rx.try_iter() {
-                    match cmd {
-                        Cmd::TTMessage(m) => msg = m,
-                        Cmd::Tempo(tempo) => self.signal_handler.tempo = tempo,
-                    }
+            if let Some((should_tick_midi, should_tick_state, n)) = self.signal_handler.read::<{input::LAYER_COUNT}>(slice, channels, SAMPLE_RATE, &mut self.fs)? {
+                if should_tick_midi {
+                    let event = midly::live::SystemRealtime::TimingClock;
+                    self.clock_tx.send(&[event.encode()])?;
                 }
-                let msg = self.signal_handler.tick(msg, &mut self.fs)?;
-                self.input_tx.start_send(input::Cmd::Tick(msg))?;
+                if should_tick_state {
+                    let mut msg = None;
+                    // flush buffered commands
+                    for cmd in self.audio_rx.try_iter() {
+                        match cmd {
+                            Cmd::TTMessage(m) => msg = Some(m),
+                            Cmd::Tempo(tempo) => self.signal_handler.tempo = tempo,
+                        }
+                    }
+                    let msg = self.signal_handler.tick(msg, &mut self.fs)?;
+                    self.input_tx.start_send(input::Cmd::Tick(msg))?;
+                }
                 slice = &mut slice[n..];
             } else {
                 break;

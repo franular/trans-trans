@@ -349,9 +349,8 @@ impl App {
     pub fn new(
         audio_tx: std::sync::mpsc::Sender<audio::Cmd>,
     ) -> Self {
-        // let bytes0 = std::fs::read("kits/Small Faces - Rollin Over.ttk").unwrap();
         let bytes0 = std::fs::read("kits/b4.ttk").unwrap();
-        let bytes1 = std::fs::read("kits/face a.ttk").unwrap();
+        let bytes1 = std::fs::read("kits/Small Faces - Rollin Over.ttk").unwrap();
         let bytes2 = std::fs::read("kits/Dennis Coffey - Scorpio (cd).ttk").unwrap();
         let bytes3 = std::fs::read("kits/James Brown - Cold Sweat (ver.2).ttk").unwrap();
         let mut state_handler = ttcore::state::StateHandler::new(
@@ -402,13 +401,13 @@ impl App {
             .fold(0u32, |acc, v| acc | (1 << v))
     }
 
-    pub fn run(mut self, mut terminal: ratatui::DefaultTerminal, mut input_rx: futures::channel::mpsc::UnboundedReceiver<Cmd>, mut midi_out: midir::MidiOutputConnection) -> Result<()> {
+    pub fn run(mut self, mut terminal: ratatui::DefaultTerminal, mut input_rx: futures::channel::mpsc::UnboundedReceiver<Cmd>) -> Result<()> {
         let mut event_stream = crossterm::event::EventStream::new();
         while !self.quit {
             terminal.draw(|frame| {
                 frame.render_widget(&self, frame.area());
             })?;
-            self.handle_events(&mut event_stream, &mut input_rx, &mut midi_out)?;
+            self.handle_events(&mut event_stream, &mut input_rx)?;
         }
         Ok(())
     }
@@ -424,7 +423,7 @@ impl App {
             let msg = if let Some(&index) = self.onset_downs.first() {
                 if self.onset_downs.len() > 1 {
                     // push loop start
-                    let len = Self::binary_offset(&self.onset_downs, index, LAYER_COUNT as u8);
+                    let len = Self::binary_offset(&self.onset_downs, index, KIT_LEN as u8);
                     self.state_handler.push_onset(ttcore::OnsetInput::Loop { index, len })
                 } else {
                     // push loop stop | jump
@@ -468,7 +467,7 @@ impl App {
         self.send(msg)
     }
 
-    fn set_gain(&mut self, index: u8, down: bool) -> Result<()> {
+    fn mult_gain(&mut self, index: u8, down: bool) -> Result<()> {
         if down {
             self.gain_ramp.value |= 1 << index;
             let gain = if self.gain_ramp.value & 1 == 1 {
@@ -476,7 +475,7 @@ impl App {
             } else {
                 (self.gain_ramp.value >> 1) as i8 & 7
             } as f32 / 7.;
-            let msg = self.state_handler.set_gain(gain);
+            let msg = self.state_handler.mult_gain(gain);
             self.send(msg)?;
         } else {
             self.gain_ramp.value &= !(1 << index)
@@ -496,7 +495,7 @@ impl App {
         Ok(())
     }
 
-    fn set_pitch(&mut self, index: u8, down: bool) -> Result<()> {
+    fn mult_pitch(&mut self, index: u8, down: bool) -> Result<()> {
         if down {
             self.pitch_ramp.value |= 1 << index;
             let pitch = (if self.pitch_ramp.value & 1 == 1 {
@@ -504,7 +503,7 @@ impl App {
             } else {
                 (self.pitch_ramp.value >> 1) as i8 & 7
             } * 16) as f32 / 7.;
-            let msg = self.state_handler.set_pitch(pitch);
+            let msg = self.state_handler.mult_pitch(pitch);
             self.send(msg)?;
         } else {
             self.pitch_ramp.value &= !(1 << index)
@@ -581,17 +580,21 @@ impl App {
         } else {
             match 63 - key {
                 4 => self.num_lock = down,
+                8 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Micro },
+                9 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Macro },
                 10 => self.push_record(down)?,
                 11 => self.sustain = down,
-                12 => if down { self.set_legato(!self.legato)? },
-                13 => if down { self.state_handler.layer = 1 } else { self.state_handler.layer = 0 },
-                14 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Micro },
-                15 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Macro },
+                12 => {
+                    let msg = self.state_handler.push_reverse(down);
+                    self.send(msg)?;
+                }
+                13 => if down { self.set_legato(!self.legato)? },
+                14 => if down { self.state_handler.layer = 1 } else { self.state_handler.layer = 0 },
                 k if (24..32).contains(&k) => self.push_phrase(k-24, down)?,
                 k if (32..40).contains(&k) => self.push_onset(k-32,down)?,
-                k if (40..44).contains(&k) => self.set_pitch(k-40,down)?,
+                k if (40..44).contains(&k) => self.mult_pitch(k-40,down)?,
                 k if (44..48).contains(&k) => self.ramp_pitch(3-(k-44),down)?,
-                k if (48..52).contains(&k) => self.set_gain(k-48,down)?,
+                k if (48..52).contains(&k) => self.mult_gain(k-48,down)?,
                 k if (52..56).contains(&k) => self.ramp_gain(3-(k-52),down)?,
                 k if (56..60).contains(&k) => if down { self.push_kit(0,k-56) },
                 k if (60..64).contains(&k) => if down { self.push_kit(1,k-60) },
@@ -601,7 +604,40 @@ impl App {
         Ok(())
     }
 
-    fn handle_events(&mut self, event_stream: &mut crossterm::event::EventStream, input_rx: &mut futures::channel::mpsc::UnboundedReceiver<Cmd>, midi_out: &mut midir::MidiOutputConnection) -> Result<()> {
+    fn control_event(&mut self, controller: u8, value: u8) -> Result<()> {
+        let value = 127 - value;
+        log::info!("{}", value);
+        match 56 - controller {
+            1 => {
+                let msg = self.state_handler.base_gain((value as f32 - 64.) / 64., 0);
+                self.send(msg)?;
+            }
+            2 => {
+                let msg = self.state_handler.base_pitch((value as f32 - 64.) / 64. * 16., 0);
+                self.send(msg)?;
+            }
+            4 => {
+                let msg = self.state_handler.push_width(value as f32 / 127., 0);
+                self.send(msg)?;
+            }
+            5 => {
+                let msg = self.state_handler.base_gain((value as f32 - 64.) / 64., 1);
+                self.send(msg)?;
+            }
+            6 => {
+                let msg = self.state_handler.base_pitch((value as f32 - 64.) / 64. * 16., 1);
+                self.send(msg)?;
+            }
+            8 => {
+                let msg = self.state_handler.push_width(value as f32 / 127., 1);
+                self.send(msg)?;
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+
+    fn handle_events(&mut self, event_stream: &mut crossterm::event::EventStream, input_rx: &mut futures::channel::mpsc::UnboundedReceiver<Cmd>) -> Result<()> {
         let maybe_timeout = match [self.dialog.timeout()]
             .into_iter()
             .enumerate()
@@ -641,16 +677,14 @@ impl App {
                         self.throbber.high = msg.tick.rem_euclid(self.state_handler.get_ticks_per_beat() as i32) < self.state_handler.get_ticks_per_beat() as i32 / 3;
                         let msg = self.state_handler.tick(msg);
                         self.audio_tx.send(audio::Cmd::TTMessage(msg))?;
-                        // midi clock
-                        let event = midly::live::SystemRealtime::TimingClock;
-                        midi_out.send(&[event.encode()])?;
                     }
                     Cmd::Midi(msg) => match msg {
                         midly::MidiMessage::NoteOff { key, .. } => self.key_event(key.as_int(), false)?,
                         midly::MidiMessage::NoteOn { key, .. } => self.key_event(key.as_int(), true)?,
+                        midly::MidiMessage::Controller { controller, value } => self.control_event(controller.as_int(), value.as_int())?,
                         _ => (),
                     }
-                }
+                    }
                 Ok(())
             }
         }}.fuse());

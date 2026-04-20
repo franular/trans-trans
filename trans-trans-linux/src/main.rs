@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     ).expect("failed to connect to midi input");
     let midi_out = midi_out.connect(out_port, "trans-trans").expect("failed to connect to midi output");
 
-    unsafe { audio::AUDIO_HANDLER.replace(audio::AudioHandler::new(audio_rx, input_tx)) };
+    unsafe { audio::AUDIO_HANDLER.replace(audio::AudioHandler::new(audio_rx, input_tx, midi_out)) };
     let app = input::App::new(audio_tx);
 
     let terminal = ratatui::init();
@@ -104,7 +104,7 @@ fn main() -> Result<()> {
         ),
     )?;
 
-    let app_result = app.run(terminal, input_rx, midi_out);
+    let app_result = app.run(terminal, input_rx);
     crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
