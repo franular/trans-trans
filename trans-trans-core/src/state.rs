@@ -159,7 +159,7 @@ impl<F: FileHandler> OnsetEvent<Modded<signal::Onset<F>>> {
                 }
                 OnsetEvent::Loop { mut tick, mut onset, index, len, .. } => {
                     tick += if to.mods.reverse { -1 } else { 1 };
-                    if tick >= len as i32 {
+                    if !(0..len as i32).contains(&tick) {
                         if onset.inner.onset_start.is_none() {
                             return Ok(OnsetEvent::Stop);
                         }

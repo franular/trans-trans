@@ -53,30 +53,6 @@ macro_rules! repeat {
     };
 }
 
-macro_rules! release {
-    (+$i:ident) => {
-        crossterm::event::KeyEvent {
-            code: crossterm::event::KeyCode::Modifier(crossterm::event::ModifierKeyCode::$i),
-            kind: crossterm::event::KeyEventKind::Release,
-            ..
-        }
-    };
-    (-$i:ident) => {
-        crossterm::event::KeyEvent {
-            code: crossterm::event::KeyCode::$i,
-            kind: crossterm::event::KeyEventKind::Release,
-            ..
-        }
-    };
-    ($c:pat) => {
-        crossterm::event::KeyEvent {
-            code: crossterm::event::KeyCode::Char($c),
-            kind: crossterm::event::KeyEventKind::Release,
-            ..
-        }
-    };
-}
-
 const INIT_PHRASE_SNAP_START: ttcore::Snap = ttcore::Snap::Micro;
 const INIT_PHRASE_SNAP_LEN: ttcore::Snap = ttcore::Snap::Macro;
 const INIT_PITCH_INTERVAL: f32 = 1.0594631;
@@ -85,11 +61,11 @@ pub const INIT_TEMPO: f32 = 192.;
 pub const INIT_TICKS_PER_BEAT: u32 = 16;
 pub const INIT_TICKS_PER_INPUT: u32 = 4;
 pub const INIT_TICKS_PER_STEP: u32 = 16;
-pub const INIT_STEPS_PER_MEAS: u32 = 7;
+pub const INIT_STEPS_PER_MEAS: u32 = 4;
 
 const BANK_COUNT: usize = 2;
 pub const LAYER_COUNT: usize = 2;
-const KIT_COUNT: usize = 4;
+const KIT_COUNT: usize = 15;
 const KIT_LEN: usize = 8;
 const PHRASE_COUNT: usize = 8;
 const PHRASE_LEN: usize = 1024;
@@ -319,7 +295,7 @@ impl NumBuffer {
 
 #[derive(Default)]
 struct Ramp {
-    value: u8,
+    mult: u8,
     delta: u8,
 }
 
@@ -335,6 +311,7 @@ pub struct App {
     legato: bool,
     sustain: bool,
 
+    kit_downs: [u8; BANK_COUNT],
     onset_downs: Vec<u8>,
     gain_ramp: Ramp,
     pitch_ramp: Ramp,
@@ -350,9 +327,13 @@ impl App {
         audio_tx: std::sync::mpsc::Sender<audio::Cmd>,
     ) -> Self {
         let bytes0 = std::fs::read("kits/b4.ttk").unwrap();
-        let bytes1 = std::fs::read("kits/Small Faces - Rollin Over.ttk").unwrap();
-        let bytes2 = std::fs::read("kits/Dennis Coffey - Scorpio (cd).ttk").unwrap();
-        let bytes3 = std::fs::read("kits/James Brown - Cold Sweat (ver.2).ttk").unwrap();
+        let bytes1 = std::fs::read("kits/Giuliano Sorgini - Wondering Man0.ttk").unwrap();
+        let bytes2 = std::fs::read("kits/Giuliano Sorgini - Wondering Man1.ttk").unwrap();
+        let bytes3 = std::fs::read("kits/Soul Drifter - Funky Brother0.ttk").unwrap();
+        let bytes4 = std::fs::read("kits/Soul Drifter - Funky Brother1.ttk").unwrap();
+        // let bytes3 = std::fs::read("kits/Dennis Coffey - Scorpio (cd).ttk").unwrap();
+        // let bytes4 = std::fs::read("kits/Small Faces - Rollin Over.ttk").unwrap();
+        // let bytes5 = std::fs::read("kits/James Brown - Cold Sweat (ver.2).ttk").unwrap();
         let mut state_handler = ttcore::state::StateHandler::new(
             INIT_PHRASE_SNAP_START,
             INIT_PHRASE_SNAP_LEN,
@@ -364,12 +345,13 @@ impl App {
             INIT_STEPS_PER_MEAS,
         );
         // FIXME: remove dev defaults
-        state_handler.kits = [
-            Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes0).unwrap()),
-            Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes1).unwrap()),
-            Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes2).unwrap()),
-            Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes3).unwrap()),
-        ];
+        state_handler.kits[0] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes0).unwrap());
+        state_handler.kits[1] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes1).unwrap());
+        state_handler.kits[2] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes2).unwrap());
+        state_handler.kits[3] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes3).unwrap());
+        state_handler.kits[4] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes4).unwrap());
+        // state_handler.kits[4] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes4).unwrap());
+        // state_handler.kits[5] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes5).unwrap());
         Self {
             quit: false,
 
@@ -382,6 +364,7 @@ impl App {
             legato: false,
             sustain: false,
 
+            kit_downs: [0; LAYER_COUNT],
             onset_downs: Vec::new(),
             gain_ramp: Ramp::default(),
             pitch_ramp: Ramp::default(),
@@ -469,16 +452,19 @@ impl App {
 
     fn mult_gain(&mut self, index: u8, down: bool) -> Result<()> {
         if down {
-            self.gain_ramp.value |= 1 << index;
-            let gain = if self.gain_ramp.value & 1 == 1 {
-                -((self.gain_ramp.value >> 1) as i8 & 7)
+            self.gain_ramp.mult |= 1 << index;
+            let gain = if self.gain_ramp.mult & 1 == 1 {
+                -((self.gain_ramp.mult >> 1) as i8 & 7)
             } else {
-                (self.gain_ramp.value >> 1) as i8 & 7
+                (self.gain_ramp.mult >> 1) as i8 & 7
             } as f32 / 7.;
+            if self.gain_ramp.delta == 0 {
+                self.state_handler.ramp_gain(0.);
+            }
             let msg = self.state_handler.mult_gain(gain);
             self.send(msg)?;
         } else {
-            self.gain_ramp.value &= !(1 << index)
+            self.gain_ramp.mult &= !(1 << index)
         };
         Ok(())
     }
@@ -497,16 +483,19 @@ impl App {
 
     fn mult_pitch(&mut self, index: u8, down: bool) -> Result<()> {
         if down {
-            self.pitch_ramp.value |= 1 << index;
-            let pitch = (if self.pitch_ramp.value & 1 == 1 {
-                -((self.pitch_ramp.value >> 1) as i8 & 7)
+            self.pitch_ramp.mult |= 1 << index;
+            let pitch = (if self.pitch_ramp.mult & 1 == 1 {
+                -((self.pitch_ramp.mult >> 1) as i8 & 7)
             } else {
-                (self.pitch_ramp.value >> 1) as i8 & 7
+                (self.pitch_ramp.mult >> 1) as i8 & 7
             } * 16) as f32 / 7.;
+            if self.pitch_ramp.delta == 0 {
+                self.state_handler.ramp_pitch(0.);
+            }
             let msg = self.state_handler.mult_pitch(pitch);
             self.send(msg)?;
         } else {
-            self.pitch_ramp.value &= !(1 << index)
+            self.pitch_ramp.mult &= !(1 << index)
         };
         Ok(())
     }
@@ -523,8 +512,13 @@ impl App {
         Ok(())
     }
 
-    fn push_kit(&mut self, bank: u8, index: u8) {
-        self.state_handler.set_kit_index(bank, index);
+    fn push_kit(&mut self, bank: u8, index: u8, down: bool) {
+        if down {
+            self.kit_downs[bank as usize] |= 1 << index;
+            self.state_handler.set_kit_index(bank, self.kit_downs[bank as usize]-1);
+        } else {
+            self.kit_downs[bank as usize] &= !(1 << index);
+        }
     }
 
     fn set_legato(&mut self, value: bool) -> Result<()> {
@@ -539,7 +533,7 @@ impl App {
     fn key_event(&mut self, key: u8, down: bool) -> Result<()> {
         if self.num_lock {
             match 63 - key {
-                4 => if down { self.num_lock = down },
+                4 => self.num_lock = down,
                 5 => if down { self.num_buffer.push_num(0) },
                 6 => if down { self.num_buffer.pop_num() },
                 7 => if down {
@@ -596,8 +590,8 @@ impl App {
                 k if (44..48).contains(&k) => self.ramp_pitch(3-(k-44),down)?,
                 k if (48..52).contains(&k) => self.mult_gain(k-48,down)?,
                 k if (52..56).contains(&k) => self.ramp_gain(3-(k-52),down)?,
-                k if (56..60).contains(&k) => if down { self.push_kit(0,k-56) },
-                k if (60..64).contains(&k) => if down { self.push_kit(1,k-60) },
+                k if (56..60).contains(&k) => self.push_kit(0,k-56,down),
+                k if (60..64).contains(&k) => self.push_kit(1,k-60,down),
                 _ => (),
             }
         }
@@ -606,7 +600,6 @@ impl App {
 
     fn control_event(&mut self, controller: u8, value: u8) -> Result<()> {
         let value = 127 - value;
-        log::info!("{}", value);
         match 56 - controller {
             1 => {
                 let msg = self.state_handler.base_gain((value as f32 - 64.) / 64., 0);

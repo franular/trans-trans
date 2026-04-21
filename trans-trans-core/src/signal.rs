@@ -60,8 +60,8 @@ impl<F: FileHandler> Onset<F> {
 
 pub struct SignalHandler<const LAYER_COUNT: usize, F: FileHandler> {
     grains: [GrainReader; LAYER_COUNT],
-    midi_clock: f32,
-    pub tick: f32,
+    pub tick: i32,
+    pub beat: f32,
     pub tempo: f32,
     ticks_per_beat: u32,
     pub ticks_per_meas: u32,
@@ -73,8 +73,8 @@ impl<const LAYER_COUNT: usize, F: FileHandler> SignalHandler<LAYER_COUNT, F> {
     pub fn new(tempo: f32, ticks_per_beat: u32, ticks_per_input: u32, ticks_per_step: u32, steps_per_meas: u32) -> Self {
         Self {
             grains: core::array::from_fn(|_| GrainReader::default()),
-            midi_clock: 0.,
-            tick: 0.,
+            tick: 0,
+            beat: 0.,
             tempo,
             ticks_per_beat: ticks_per_beat.max(1),
             ticks_per_meas: (ticks_per_step * steps_per_meas).max(ticks_per_input).max(1),
@@ -113,17 +113,17 @@ impl<const LAYER_COUNT: usize, F: FileHandler> SignalHandler<LAYER_COUNT, F> {
             );
             buffer[i * channels] *= mult;
             buffer[i * channels + 1] *= mult;
-            let tick_delta = self.ticks_per_beat as f32 * self.tempo / (60. * sample_rate as f32);
-            let should_tick_midi = self.midi_clock.ceil() != {
-                self.midi_clock = (self.midi_clock + tick_delta * 24. / self.ticks_per_beat as f32).rem_euclid(24.);
-                self.midi_clock.ceil()
-            };
-            let should_tick_state = self.tick.ceil() != {
-                self.tick = (self.tick + tick_delta).rem_euclid(self.ticks_per_meas as f32);
-                self.tick.ceil()
-            };
-            if should_tick_midi || should_tick_state {
-                return Ok(Some((should_tick_midi, should_tick_state, (i + 1) * channels)));
+            let midi_cmp = (self.beat * 24.).ceil();
+            let tick_cmp = (self.beat * self.ticks_per_beat as f32).ceil();
+            let beat_delta = self.tempo / (60. * sample_rate as f32);
+            self.beat = (self.beat + beat_delta).fract();
+            let wrap_midi = midi_cmp != (self.beat * 24.).ceil();
+            let wrap_tick = tick_cmp != (self.beat * self.ticks_per_beat as f32).ceil();
+            if wrap_tick {
+                self.tick = (self.tick + 1).rem_euclid(self.ticks_per_meas as i32);
+            }
+            if wrap_midi || wrap_tick {
+                return Ok(Some((wrap_midi, wrap_tick, (i + 1) * channels)));
             }
         }
         Ok(None)
@@ -149,6 +149,6 @@ impl<const LAYER_COUNT: usize, F: FileHandler> SignalHandler<LAYER_COUNT, F> {
                 core::mem::forget(temp);
             }
         }
-        Ok(Message { tick: self.tick.floor() as i32, inputs: self.inputs.clone() })
+        Ok(Message { tick: self.tick, inputs: self.inputs.clone() })
     }
 }

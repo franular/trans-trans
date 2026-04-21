@@ -3,6 +3,8 @@
 use std::str::FromStr;
 use quick_xml::events::Event;
 
+const KIT_LEN: usize = 8;
+
 #[derive(PartialEq)]
 enum State {
     None,
@@ -10,7 +12,7 @@ enum State {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    for entry in std::fs::read_dir("in")?.flatten() {
+    for entry in std::fs::read_dir("xrnis")?.flatten() {
         if entry.path().extension().is_some_and(|v| v == std::ffi::OsString::from_str("xrni").unwrap()) {
             let mut zip = zip::ZipArchive::new(std::fs::File::open(entry.path())?)?;
 
@@ -69,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  {:>8}", sp);
             }
 
-            // extract .flac and convert to .wav in `onsets/breaks` directory
+            // extract .flac and convert to .wav in `onsets` directory
             let mut flac_name = String::new();
             for name in zip.file_names() {
                 // of form `SampleData/SampleXX (<SAMPLE NAME>).flac` where XX is sample index (order in XML, i think)
@@ -85,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bits_per_sample: 16,
                 sample_format: hound::SampleFormat::Int,
             };
-            let mut wav_writer = hound::WavWriter::create(format!("onsets/breaks/{}.wav", sample_name), wav_spec)?;
+            let mut wav_writer = hound::WavWriter::create(format!("onsets/{}.wav", sample_name), wav_spec)?;
             let mut frame_reader = flac_reader.blocks();
             let mut block = claxon::Block::empty();
             while let Some(next_block) = frame_reader.read_next_or_eof(block.into_buffer())? {
@@ -100,16 +102,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             wav_writer.finalize()?;
             // save onsets to kit
-            let onsets = sample_positions.into_iter().map(|pos| {
-                ttcore::state::Onset {
-                    path: format!("onsets/breaks/{}.wav", sample_name),
-                    start: pos as u32,
-                    beat_count: beat_sync_lines as u32,
+            if sample_positions.len() > KIT_LEN {
+                for k in 0..=(sample_positions.len() - 1) / KIT_LEN {
+                    let onsets: [_; KIT_LEN] = core::array::from_fn(|i| Some(ttcore::state::Onset {
+                        path: format!("onsets/{}.wav", sample_name),
+                        onset_start: Some(*sample_positions.get(k * KIT_LEN + i)? as u32),
+                        beat_count: beat_sync_lines as u32,
+                    }));
+                    let kit = ttcore::state::Kit { onsets };
+                    let ttk_file = std::fs::File::create(format!("kits/{}{}.ttk", sample_name, k))?;
+                    serde_json::to_writer_pretty(ttk_file, &kit)?;
                 }
-            }).collect::<Vec<_>>().into_boxed_slice();
-            let kit = ttcore::state::Kit { onsets };
-            let ttk_file = std::fs::File::create(format!("kits/{}.ttk", sample_name))?;
-            serde_json::to_writer_pretty(ttk_file, &kit)?;
+            } else {
+                let onsets: [_; KIT_LEN] = core::array::from_fn(|i| Some(ttcore::state::Onset {
+                    path: format!("onsets/{}.wav", sample_name),
+                    onset_start: Some(*sample_positions.get(i)? as u32),
+                    beat_count: beat_sync_lines as u32,
+                }));
+                let kit = ttcore::state::Kit { onsets };
+                let ttk_file = std::fs::File::create(format!("kits/{}.ttk", sample_name))?;
+                serde_json::to_writer_pretty(ttk_file, &kit)?;
+            }
         }
     }
     Ok(())
