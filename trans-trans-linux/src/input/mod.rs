@@ -53,7 +53,7 @@ macro_rules! repeat {
     };
 }
 
-const INIT_PHRASE_SNAP_START: ttcore::Snap = ttcore::Snap::Micro;
+const INIT_PHRASE_SNAP_START: ttcore::Snap = ttcore::Snap::Macro;
 const INIT_PHRASE_SNAP_LEN: ttcore::Snap = ttcore::Snap::Macro;
 const INIT_PITCH_INTERVAL: f32 = 1.0594631;
 const INIT_RAMP_SNAP: ttcore::Snap = ttcore::Snap::Macro;
@@ -326,13 +326,13 @@ impl App {
     pub fn new(
         audio_tx: std::sync::mpsc::Sender<audio::Cmd>,
     ) -> Self {
-        let bytes0 = std::fs::read("kits/b4.ttk").unwrap();
-        let bytes1 = std::fs::read("kits/Giuliano Sorgini - Wondering Man0.ttk").unwrap();
-        let bytes2 = std::fs::read("kits/Giuliano Sorgini - Wondering Man1.ttk").unwrap();
+        let bytes0 = std::fs::read("kits/Giuliano Sorgini - Wondering Man0.ttk").unwrap();
+        let bytes1 = std::fs::read("kits/Giuliano Sorgini - Wondering Man1.ttk").unwrap();
+        let bytes2 = std::fs::read("kits/Dennis Coffey - Scorpio (cd).ttk").unwrap();
         let bytes3 = std::fs::read("kits/Soul Drifter - Funky Brother0.ttk").unwrap();
         let bytes4 = std::fs::read("kits/Soul Drifter - Funky Brother1.ttk").unwrap();
-        // let bytes3 = std::fs::read("kits/Dennis Coffey - Scorpio (cd).ttk").unwrap();
-        // let bytes4 = std::fs::read("kits/Small Faces - Rollin Over.ttk").unwrap();
+        let bytes5 = std::fs::read("kits/Small Faces - Rollin Over.ttk").unwrap();
+        let bytes6 = std::fs::read("kits/b4.ttk").unwrap();
         // let bytes5 = std::fs::read("kits/James Brown - Cold Sweat (ver.2).ttk").unwrap();
         let mut state_handler = ttcore::state::StateHandler::new(
             INIT_PHRASE_SNAP_START,
@@ -350,8 +350,12 @@ impl App {
         state_handler.kits[2] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes2).unwrap());
         state_handler.kits[3] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes3).unwrap());
         state_handler.kits[4] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes4).unwrap());
-        // state_handler.kits[4] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes4).unwrap());
-        // state_handler.kits[5] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes5).unwrap());
+        state_handler.kits[5] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes5).unwrap());
+        state_handler.kits[6] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes6).unwrap());
+        state_handler.layer = 1;
+        state_handler.set_kit_index(0,6);
+        state_handler.set_kit_index(1,6);
+        state_handler.layer = 0;
         Self {
             quit: false,
 
@@ -532,7 +536,7 @@ impl App {
 
     fn key_event(&mut self, key: u8, down: bool) -> Result<()> {
         if self.num_lock {
-            match 63 - key {
+            match key {
                 4 => self.num_lock = down,
                 5 => if down { self.num_buffer.push_num(0) },
                 6 => if down { self.num_buffer.pop_num() },
@@ -572,7 +576,7 @@ impl App {
                 _ => (),
             }
         } else {
-            match 63 - key {
+            match key {
                 4 => self.num_lock = down,
                 8 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Micro },
                 9 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Macro },
@@ -584,6 +588,11 @@ impl App {
                 }
                 13 => if down { self.set_legato(!self.legato)? },
                 14 => if down { self.state_handler.layer = 1 } else { self.state_handler.layer = 0 },
+                15 => if down {
+                    self.record_mask = Some(Vec::new());
+                } else if let Some(mask) = self.record_mask.take() {
+                    self.state_handler.set_record_mask(&mask);
+                }
                 k if (24..32).contains(&k) => self.push_phrase(k-24, down)?,
                 k if (32..40).contains(&k) => self.push_onset(k-32,down)?,
                 k if (40..44).contains(&k) => self.mult_pitch(k-40,down)?,
@@ -599,29 +608,28 @@ impl App {
     }
 
     fn control_event(&mut self, controller: u8, value: u8) -> Result<()> {
-        let value = 127 - value;
-        match 56 - controller {
-            1 => {
+        match controller - 48 {
+            0 => {
                 let msg = self.state_handler.base_gain((value as f32 - 64.) / 64., 0);
                 self.send(msg)?;
             }
-            2 => {
+            1 => {
                 let msg = self.state_handler.base_pitch((value as f32 - 64.) / 64. * 16., 0);
                 self.send(msg)?;
             }
-            4 => {
+            3 => {
                 let msg = self.state_handler.push_width(value as f32 / 127., 0);
                 self.send(msg)?;
             }
-            5 => {
+            4 => {
                 let msg = self.state_handler.base_gain((value as f32 - 64.) / 64., 1);
                 self.send(msg)?;
             }
-            6 => {
+            5 => {
                 let msg = self.state_handler.base_pitch((value as f32 - 64.) / 64. * 16., 1);
                 self.send(msg)?;
             }
-            8 => {
+            7 => {
                 let msg = self.state_handler.push_width(value as f32 / 127., 1);
                 self.send(msg)?;
             }

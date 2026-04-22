@@ -597,7 +597,11 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
                     if let Some(phrase) = self.phrase_writer.try_store(self.ticks_per_input) && let Some(store_to) = self.phrase_writer.try_advance() {
                         self.phrases[store_to as usize] = Some(phrase);
                         let _ = self.push_phrase(PhraseInput::Hold { index: store_to });
-                        self.mod_phrase_start(0);
+                        if matches!(self.phrase_snap_start,Snap::Macro) {
+                            self.mod_phrase_start(1);
+                        } else {
+                            self.mod_phrase_start(0);
+                        }
                         self.mod_phrase_len(0);
                     }
                 }
@@ -786,15 +790,36 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
     /// should be called before `StateHandler::tick`
     pub fn mod_phrase_start(&mut self, delta: i32) {
         if let Some(reader) = &self.active_phrases[self.layer as usize] {
-            let Phrase { start, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
+            let Phrase { events, start, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
             match self.phrase_snap_start {
                 Snap::Micro => {
                     let scale = self.ticks_per_step as i32;
                     *start = ((*start as i32 + delta * scale) / scale * scale).rem_euclid(PHRASE_LEN as i32) as u32;
                 }
                 Snap::Macro => {
-                    let scale = self.ticks_per_step as i32 * self.steps_per_meas as i32;
-                    *start = ((*start as i32 + delta * scale) / scale * scale).rem_euclid(PHRASE_LEN as i32) as u32;
+                    // let scale = self.ticks_per_step as i32 * self.steps_per_meas as i32;
+                    // *start = ((*start as i32 + delta * scale) / scale * scale).rem_euclid(PHRASE_LEN as i32) as u32;
+                    if delta == 0 { return; }
+                    if delta.is_negative() && let Some((delta, _)) = events
+                        .iter()
+                        .rev()
+                        .cycle()
+                        .skip((-(*start as i32) + 1).rem_euclid(PHRASE_LEN as i32) as usize)
+                        .enumerate()
+                        .filter(|(_, m)| m.inner.as_ref().is_some_and(|e| !matches!(e, OnsetEvent::Stop)))
+                        .nth(delta.unsigned_abs() as usize - 1)
+                    {
+                        *start = (*start as i32 - delta as i32 - 2).rem_euclid(PHRASE_LEN as i32) as u32;
+                    } else if let Some((delta, _)) = events
+                        .iter()
+                        .cycle()
+                        .skip(*start as usize + 1)
+                        .enumerate()
+                        .filter(|(_, m)| m.inner.as_ref().is_some_and(|e| !matches!(e, OnsetEvent::Stop)))
+                        .nth(delta as usize - 1)
+                    {
+                        *start = (*start + delta as u32 + 1).rem_euclid(PHRASE_LEN as u32);
+                    }
                 }
             }
         }
