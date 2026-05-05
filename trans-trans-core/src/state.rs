@@ -35,7 +35,7 @@ pub enum PhraseInput {
 
 pub enum RecordInput {
     Stop,
-    Start,
+    Start { layer: u8 },
 }
 
 struct Buffer<const LAYER_COUNT: usize> {
@@ -322,45 +322,47 @@ impl PhraseReader {
 enum WriterState {
     #[default]
     Idle,
-    Recording { start: u32, len: u32 },
+    Recording { start: u32, len: u32, layer: u8 },
 }
 
-pub struct PhraseWriter<const PHRASE_COUNT: usize, const PHRASE_LEN: usize> {
+pub struct PhraseWriter<const LAYER_COUNT: usize, const PHRASE_COUNT: usize, const PHRASE_LEN: usize> {
     /// indices of `StateHandler`'s Phrases which is overwritten by `Self::store`
     /// defaults to all Phrases
     store_mask: heapless::Vec<u8, PHRASE_COUNT>,
     store_index: usize,
-    queue: heapless::HistoryBuf<Modded<Option<OnsetEvent<Onset>>>, PHRASE_LEN>,
+    queue: heapless::HistoryBuf<[Modded<Option<OnsetEvent<Onset>>>; LAYER_COUNT], PHRASE_LEN>,
     state: WriterState,
 }
 
-impl<const PHRASE_COUNT: usize, const PHRASE_LEN: usize> PhraseWriter<PHRASE_COUNT, PHRASE_LEN> {
-    pub fn push(&mut self, event: Modded<Option<OnsetEvent<Onset>>>) {
-        self.queue.write(event);
+impl<const LAYER_COUNT: usize, const PHRASE_COUNT: usize, const PHRASE_LEN: usize> PhraseWriter<LAYER_COUNT, PHRASE_COUNT, PHRASE_LEN> {
+    pub fn push(&mut self, layers: [Modded<Option<OnsetEvent<Onset>>>; LAYER_COUNT]) {
+        self.queue.write(layers);
         if let WriterState::Recording { len, .. } = &mut self.state { *len += 1 };
     }
 
     /// should be called before input tick
-    pub fn try_start(&mut self) {
+    pub fn try_start(&mut self, layer: u8) {
         if matches!(self.state, WriterState::Idle) {
             self.state = WriterState::Recording {
                 start: ((self.queue.recent_index().unwrap_or(PHRASE_LEN)) % PHRASE_LEN) as u32,
                 len: 0,
+                layer,
             };
         }
     }
 
     /// should be called before input tick
-    pub fn try_store(&mut self, min_len: u32) -> Option<Phrase<PHRASE_LEN>> {
-        if let WriterState::Recording { start, mut len } = self.state && len > min_len {
+    /// returns (recorded phrase, layer index)
+    pub fn try_store(&mut self, min_len: u32) -> Option<(Phrase<PHRASE_LEN>, u8)> {
+        if let WriterState::Recording { start, mut len, layer } = self.state && len > min_len {
             len = len.min(PHRASE_LEN as u32);
             let phrase = Phrase {
-                events: core::array::from_fn(|i| self.queue.as_slice().get(i).cloned().unwrap_or_default()),
+                events: core::array::from_fn(|i| self.queue.as_slice().get(i).map(|l| l[layer as usize].clone()).unwrap_or_default()),
                 start,
                 len,
             };
             self.state = WriterState::Idle;
-            return Some(phrase);
+            return Some((phrase, layer));
         }
         self.state = WriterState::Idle;
         None
@@ -376,7 +378,7 @@ impl<const PHRASE_COUNT: usize, const PHRASE_LEN: usize> PhraseWriter<PHRASE_COU
     }
 }
 
-impl<const PHRASE_COUNT: usize, const PHRASE_LEN: usize> Default for PhraseWriter<PHRASE_COUNT, PHRASE_LEN> {
+impl<const LAYER_COUNT: usize, const PHRASE_COUNT: usize, const PHRASE_LEN: usize> Default for PhraseWriter<LAYER_COUNT, PHRASE_COUNT, PHRASE_LEN> {
     fn default() -> Self {
         Self {
             store_mask: heapless::Vec::from_iter(0..PHRASE_COUNT as u8),
@@ -394,12 +396,11 @@ pub struct Kit<const KIT_LEN: usize> {
 }
 
 pub struct StateHandler<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, const KIT_LEN: usize, const PHRASE_COUNT: usize, const PHRASE_LEN: usize> {
-    pub layer: u8,
     pub kits: [Option<Kit<KIT_LEN>>; KIT_COUNT],
     kit_indices: [[u8; BANK_COUNT]; LAYER_COUNT],
 
     pub phrases: [Option<Phrase<PHRASE_LEN>>; PHRASE_COUNT],
-    pub phrase_writer: PhraseWriter<PHRASE_COUNT, PHRASE_LEN>,
+    pub phrase_writer: PhraseWriter<LAYER_COUNT, PHRASE_COUNT, PHRASE_LEN>,
     pub phrase_snap_start: Snap,
     pub phrase_snap_len: Snap,
 
@@ -412,7 +413,7 @@ pub struct StateHandler<const BANK_COUNT: usize, const LAYER_COUNT: usize, const
     gain_ramps: [Ramp; LAYER_COUNT],
     pitch_ramps: [Ramp; LAYER_COUNT],
     widths: [f32; LAYER_COUNT],
-    reverse: bool,
+    reverses: [bool; LAYER_COUNT],
 
     pass_input: bool,
     ticks_per_input: u32,
@@ -435,7 +436,6 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         steps_per_meas: u32,
     ) -> Self {
         Self {
-            layer: 0,
             kits: core::array::from_fn(|_| None),
             kit_indices: [[0; BANK_COUNT]; LAYER_COUNT],
 
@@ -453,7 +453,7 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
             gain_ramps: core::array::from_fn(|_| Ramp::new()),
             pitch_ramps: core::array::from_fn(|_| Ramp::new()),
             widths: [1.; LAYER_COUNT],
-            reverse: false,
+            reverses: [false; LAYER_COUNT],
             
             pass_input: false,
             ticks_per_input,
@@ -561,7 +561,7 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
                                 pan: ((index as f32 / (KIT_LEN - 1) as f32) - 0.5) * self.widths[l] + 0.5,
                                 gain: self.gain_ramps[l].net(),
                                 speed: self.pitch_ramps[l].net(),
-                                reverse: self.reverse,
+                                reverse: self.reverses[l],
                             },
                         };
                         OnsetEvent::Hold { tick, onset, index }
@@ -580,7 +580,7 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
                                 pan: ((index as f32 / (KIT_LEN - 1) as f32) - 0.5) * self.widths[l] + 0.5,
                                 gain: self.gain_ramps[l].net(),
                                 speed: self.pitch_ramps[l].net(),
-                                reverse: self.reverse,
+                                reverse: self.reverses[l],
                             },
                         };
                         OnsetEvent::Loop { tick, onset, index, len }
@@ -594,18 +594,18 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         if let Some(input) = self.buffer.record.take() {
             match input {
                 RecordInput::Stop => {
-                    if let Some(phrase) = self.phrase_writer.try_store(self.ticks_per_input) && let Some(store_to) = self.phrase_writer.try_advance() {
+                    if let Some((phrase, layer)) = self.phrase_writer.try_store(self.ticks_per_input) && let Some(store_to) = self.phrase_writer.try_advance() {
                         self.phrases[store_to as usize] = Some(phrase);
-                        let _ = self.push_phrase(PhraseInput::Hold { index: store_to });
+                        let _ = self.push_phrase(PhraseInput::Hold { index: store_to }, layer);
                         if matches!(self.phrase_snap_start,Snap::Macro) {
-                            self.mod_phrase_start(1);
+                            self.mod_phrase_start(1, layer);
                         } else {
-                            self.mod_phrase_start(0);
+                            self.mod_phrase_start(0, layer);
                         }
-                        self.mod_phrase_len(0);
+                        self.mod_phrase_len(0, layer);
                     }
                 }
-                RecordInput::Start => self.phrase_writer.try_start(),
+                RecordInput::Start { layer } => self.phrase_writer.try_start(layer),
             }
         }
     }
@@ -621,9 +621,9 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
                 if self.buffer.onsets[l][0] == message.inputs[l] {
                     self.buffer.onsets[l][0] = self.buffer.onsets[l][1].take();
                 }
-            }
-            if let OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } = &mut self.active_onsets[self.layer as usize] {
-                onset.mods.reverse = self.reverse;
+                if let OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } = &mut self.active_onsets[l] {
+                    onset.mods.reverse = self.reverses[l];
+                }
             }
         }
         self.pass_input = pass_input;
@@ -664,29 +664,29 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
             }
         }
         let net = self.net();
-        self.phrase_writer.push(net.events[self.layer as usize].clone());
+        self.phrase_writer.push(net.events.clone());
         net
     }
 
-    pub fn push_onset(&mut self, input: OnsetInput) -> Message<LAYER_COUNT> {
+    pub fn push_onset(&mut self, input: OnsetInput, layer: u8) -> Message<LAYER_COUNT> {
         if matches!(input, OnsetInput::Stop)
-            && let OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } = &self.active_onsets[self.layer as usize]
+            && let OnsetEvent::Hold { onset, .. } | OnsetEvent::Loop { onset, .. } = &self.active_onsets[layer as usize]
             && onset.inner.onset_start.is_none() {
             return self.pass_net();
         }
         if !matches!(input, OnsetInput::Loop { .. })
-            && matches!(self.buffer.onsets[self.layer as usize][0], Some(OnsetInput::Hold { .. } | OnsetInput::Loop { .. }))
+            && matches!(self.buffer.onsets[layer as usize][0], Some(OnsetInput::Hold { .. } | OnsetInput::Loop { .. }))
         {
             // buffer rapid Stop or Hold event to next tick so the input doesn't seem to disappear
-            self.buffer.onsets[self.layer as usize][1] = Some(input);
+            self.buffer.onsets[layer as usize][1] = Some(input);
         } else {
-            self.buffer.onsets[self.layer as usize][0] = Some(input);
+            self.buffer.onsets[layer as usize][0] = Some(input);
         }
         self.pass_net()
     }
 
-    pub fn push_phrase(&mut self, input: PhraseInput) -> Message<LAYER_COUNT> {
-        self.buffer.phrases[self.layer as usize] = Some(input);
+    pub fn push_phrase(&mut self, input: PhraseInput, layer: u8) -> Message<LAYER_COUNT> {
+        self.buffer.phrases[layer as usize] = Some(input);
         self.pass_net()
     }
 
@@ -700,13 +700,13 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         self.pass_net()
     }
 
-    pub fn mult_gain(&mut self, value: f32) -> Message<LAYER_COUNT> {
-        self.gain_ramps[self.layer as usize].mult = value + 1.;
+    pub fn mult_gain(&mut self, value: f32, layer: u8) -> Message<LAYER_COUNT> {
+        self.gain_ramps[layer as usize].mult = value + 1.;
         self.pass_net()
     }
 
-    pub fn ramp_gain(&mut self, delta: f32) -> Message<LAYER_COUNT> {
-        self.gain_ramps[self.layer as usize].delta = delta / self.ticks_per_beat as f32;
+    pub fn ramp_gain(&mut self, delta: f32, layer: u8) -> Message<LAYER_COUNT> {
+        self.gain_ramps[layer as usize].delta = delta / self.ticks_per_beat as f32;
         self.pass_net()
     }
 
@@ -715,13 +715,13 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         self.pass_net()
     }
 
-    pub fn mult_pitch(&mut self, value: f32) -> Message<LAYER_COUNT> {
-        self.pitch_ramps[self.layer as usize].mult = self.pitch_interval.powf(value);
+    pub fn mult_pitch(&mut self, value: f32, layer: u8) -> Message<LAYER_COUNT> {
+        self.pitch_ramps[layer as usize].mult = self.pitch_interval.powf(value);
         self.pass_net()
     }
 
-    pub fn ramp_pitch(&mut self, delta: f32) -> Message<LAYER_COUNT> {
-        self.pitch_ramps[self.layer as usize].delta = delta / self.ticks_per_beat as f32;
+    pub fn ramp_pitch(&mut self, delta: f32, layer: u8) -> Message<LAYER_COUNT> {
+        self.pitch_ramps[layer as usize].delta = delta / self.ticks_per_beat as f32;
         self.pass_net()
     }
 
@@ -730,8 +730,8 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         self.pass_net()
     }
 
-    pub fn push_reverse(&mut self, value: bool) -> Message<LAYER_COUNT> {
-        self.reverse = value;
+    pub fn push_reverse(&mut self, value: bool, layer: u8) -> Message<LAYER_COUNT> {
+        self.reverses[layer as usize] = value;
         self.pass_net()
     }
 
@@ -763,8 +763,8 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
         self.phrase_writer.store_index = 0;
     }
 
-    pub fn set_kit_index(&mut self, bank: u8, index: u8) {
-        self.kit_indices[self.layer as usize][bank as usize] = index;
+    pub fn set_kit_index(&mut self, index: u8, bank: u8, layer: u8) {
+        self.kit_indices[layer as usize][bank as usize] = index;
     }
 
     /// for display purposes in external impl
@@ -788,8 +788,8 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
     }
 
     /// should be called before `StateHandler::tick`
-    pub fn mod_phrase_start(&mut self, delta: i32) {
-        if let Some(reader) = &self.active_phrases[self.layer as usize] {
+    pub fn mod_phrase_start(&mut self, delta: i32, layer: u8) {
+        if let Some(reader) = &self.active_phrases[layer as usize] {
             let Phrase { events, start, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
             match self.phrase_snap_start {
                 Snap::Micro => {
@@ -826,8 +826,8 @@ impl<const BANK_COUNT: usize, const LAYER_COUNT: usize, const KIT_COUNT: usize, 
     }
 
     /// should be called before `StateHandler::tick`
-    pub fn mod_phrase_len(&mut self, delta: i32) {
-        if let Some(reader) = &self.active_phrases[self.layer as usize] {
+    pub fn mod_phrase_len(&mut self, delta: i32, layer: u8) {
+        if let Some(reader) = &self.active_phrases[layer as usize] {
             let Phrase { len, .. } = self.phrases[reader.index as usize].as_mut().unwrap();
             match self.phrase_snap_len {
                 Snap::Micro => {

@@ -273,12 +273,12 @@ struct NumBuffer {
 }
 
 impl NumBuffer {
-    fn get_num(&mut self) -> u32 {
+    fn get(&mut self) -> u32 {
         self.used = true;
         self.num
     }
 
-    fn push_num(&mut self, digit: u32) {
+    fn push(&mut self, digit: u32) {
         if self.used {
             self.num = digit;
             self.used = false;
@@ -287,7 +287,7 @@ impl NumBuffer {
         }
     }
 
-    fn pop_num(&mut self) {
+    fn clear(&mut self) {
         self.num = 0;
         self.used = false;
     }
@@ -308,15 +308,16 @@ pub struct App {
     audio_stream: Option<cpal::Stream>,
     audio_tx: std::sync::mpsc::Sender<audio::Cmd>,
 
-    legato: bool,
+    layer: u8,
+    legatos: [bool; LAYER_COUNT],
     sustain: bool,
 
     kit_downs: [u8; BANK_COUNT],
-    onset_downs: Vec<u8>,
+    onset_downs: [Vec<u8>; LAYER_COUNT],
     gain_ramp: Ramp,
     pitch_ramp: Ramp,
 
-    num_lock: bool,
+    num_locks: [bool; BANK_COUNT],
     num_buffer: NumBuffer,
     record_mask: Option<Vec<u8>>,
     state_handler: ttcore::state::StateHandler<BANK_COUNT, LAYER_COUNT, KIT_COUNT, KIT_LEN, PHRASE_COUNT, PHRASE_LEN>,
@@ -352,28 +353,27 @@ impl App {
         state_handler.kits[4] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes4).unwrap());
         state_handler.kits[5] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes5).unwrap());
         state_handler.kits[6] = Some(serde_json::from_slice::<ttcore::state::Kit<KIT_LEN>>(&bytes6).unwrap());
-        state_handler.layer = 1;
-        state_handler.set_kit_index(0,6);
-        state_handler.set_kit_index(1,6);
-        state_handler.layer = 0;
+        // state_handler.set_kit_index(6, 0, 0);
+        // state_handler.set_kit_index(6, 1, 0);
         Self {
             quit: false,
 
             dialog: CpalConfigDialog::new(),
             throbber: Throbber::default(),
 
+            layer: 0,
             audio_stream: None,
             audio_tx,
 
-            legato: false,
+            legatos: [false; LAYER_COUNT],
             sustain: false,
 
-            kit_downs: [0; LAYER_COUNT],
-            onset_downs: Vec::new(),
+            kit_downs: [0; BANK_COUNT],
+            onset_downs: core::array::from_fn(|_| Vec::new()),
             gain_ramp: Ramp::default(),
             pitch_ramp: Ramp::default(),
 
-            num_lock: false,
+            num_locks: [false; BANK_COUNT],
             num_buffer: NumBuffer::default(),
             record_mask: None,
             state_handler,
@@ -404,28 +404,28 @@ impl App {
         Ok(())
     }
 
-    fn push_onset(&mut self, index: u8, down: bool) -> Result<()> {
-        if down { self.onset_downs.push(index) } else { self.onset_downs.retain(|v| *v != index) }
-        if down || !self.legato {
-            let msg = if let Some(&index) = self.onset_downs.first() {
-                if self.onset_downs.len() > 1 {
+    fn push_onset(&mut self, index: u8, down: bool, layer: u8) -> Result<()> {
+        if down { self.onset_downs[layer as usize].push(index) } else { self.onset_downs[layer as usize].retain(|v| *v != index) }
+        if down || !self.legatos[layer as usize] {
+            let msg = if let Some(&index) = self.onset_downs[layer as usize].first() {
+                if self.onset_downs[layer as usize].len() > 1 {
                     // push loop start
-                    let len = Self::binary_offset(&self.onset_downs, index, KIT_LEN as u8);
-                    self.state_handler.push_onset(ttcore::OnsetInput::Loop { index, len })
+                    let len = Self::binary_offset(&self.onset_downs[layer as usize], index, KIT_LEN as u8);
+                    self.state_handler.push_onset(ttcore::OnsetInput::Loop { index, len }, layer)
                 } else {
                     // push loop stop | jump
-                    self.state_handler.push_onset(ttcore::OnsetInput::Hold { index })
+                    self.state_handler.push_onset(ttcore::OnsetInput::Hold { index }, layer)
                 }
             } else {
                 // push sync
-                self.state_handler.push_onset(ttcore::OnsetInput::Stop)
+                self.state_handler.push_onset(ttcore::OnsetInput::Stop, layer)
             };
             self.send(msg)?;
         }
         Ok(())
     }
 
-    fn push_phrase(&mut self, index: u8, down: bool) -> Result<()> {
+    fn push_phrase(&mut self, index: u8, down: bool, layer: u8) -> Result<()> {
         if let Some(mask) = self.record_mask.as_mut() {
             if down {
                 mask.retain(|i| *i != index);
@@ -437,24 +437,24 @@ impl App {
             } else {
                 ttcore::PhraseInput::Stop
             };
-            let msg = self.state_handler.push_phrase(input);
+            let msg = self.state_handler.push_phrase(input, layer);
             self.send(msg)?;
         }
         Ok(())
     }
 
-    fn push_record(&mut self, down: bool) -> Result<()> {
+    fn push_record(&mut self, down: bool, layer: u8) -> Result<()> {
         let input = if down {
-            ttcore::RecordInput::Start
+            ttcore::RecordInput::Start { layer }
         } else {
-            self.set_legato(false)?;
+            self.set_legato(false, layer)?;
             ttcore::RecordInput::Stop
         };
         let msg = self.state_handler.push_record(input);
         self.send(msg)
     }
 
-    fn mult_gain(&mut self, index: u8, down: bool) -> Result<()> {
+    fn mult_gain(&mut self, index: u8, down: bool, layer: u8) -> Result<()> {
         if down {
             self.gain_ramp.mult |= 1 << index;
             let gain = if self.gain_ramp.mult & 1 == 1 {
@@ -463,9 +463,10 @@ impl App {
                 (self.gain_ramp.mult >> 1) as i8 & 7
             } as f32 / 7.;
             if self.gain_ramp.delta == 0 {
-                self.state_handler.ramp_gain(0.);
+                // FIXME: i dunno what index this should be tbh
+                self.state_handler.ramp_gain(0., (layer == 0) as u8);
             }
-            let msg = self.state_handler.mult_gain(gain);
+            let msg = self.state_handler.mult_gain(gain, layer);
             self.send(msg)?;
         } else {
             self.gain_ramp.mult &= !(1 << index)
@@ -473,19 +474,20 @@ impl App {
         Ok(())
     }
 
-    fn ramp_gain(&mut self, index: u8, down: bool) -> Result<()> {
+    fn ramp_gain(&mut self, index: u8, down: bool, layer: u8) -> Result<()> {
+        // FIXME: make gain ramp steeper
         if down { self.gain_ramp.delta |= 1 << index } else { self.gain_ramp.delta  &= !(1 << index) };
         let gain = if self.gain_ramp.delta & 1 == 1 {
             -((self.gain_ramp.delta >> 1) as i8 & 7)
         } else {
             (self.gain_ramp.delta >> 1) as i8 & 7
         } as f32 / 7.;
-        let msg = self.state_handler.ramp_gain(gain);
+        let msg = self.state_handler.ramp_gain(gain, layer);
         self.send(msg)?;
         Ok(())
     }
 
-    fn mult_pitch(&mut self, index: u8, down: bool) -> Result<()> {
+    fn mult_pitch(&mut self, index: u8, down: bool, layer: u8) -> Result<()> {
         if down {
             self.pitch_ramp.mult |= 1 << index;
             let pitch = (if self.pitch_ramp.mult & 1 == 1 {
@@ -494,9 +496,10 @@ impl App {
                 (self.pitch_ramp.mult >> 1) as i8 & 7
             } * 16) as f32 / 7.;
             if self.pitch_ramp.delta == 0 {
-                self.state_handler.ramp_pitch(0.);
+                // FIXME: i dunno what index this should be tbh
+                self.state_handler.ramp_pitch(0., (layer == 0) as u8);
             }
-            let msg = self.state_handler.mult_pitch(pitch);
+            let msg = self.state_handler.mult_pitch(pitch, layer);
             self.send(msg)?;
         } else {
             self.pitch_ramp.mult &= !(1 << index)
@@ -504,103 +507,129 @@ impl App {
         Ok(())
     }
 
-    fn ramp_pitch(&mut self, index: u8, down: bool) -> Result<()> {
+    fn ramp_pitch(&mut self, index: u8, down: bool, layer: u8) -> Result<()> {
         if down { self.pitch_ramp.delta |= 1 << index } else { self.pitch_ramp.delta  &= !(1 << index) };
         let pitch = (if self.pitch_ramp.delta & 1 == 1 {
             -((self.pitch_ramp.delta >> 1) as i8 & 7)
         } else {
             (self.pitch_ramp.delta >> 1) as i8 & 7
         } * 16) as f32 / 7.;
-        let msg = self.state_handler.ramp_pitch(pitch);
+        let msg = self.state_handler.ramp_pitch(pitch, layer);
         self.send(msg)?;
         Ok(())
     }
 
-    fn push_kit(&mut self, bank: u8, index: u8, down: bool) {
+    fn push_kit(&mut self, index: u8, down: bool, bank: u8, layer: u8) {
         if down {
             self.kit_downs[bank as usize] |= 1 << index;
-            self.state_handler.set_kit_index(bank, self.kit_downs[bank as usize]-1);
+            self.state_handler.set_kit_index(self.kit_downs[bank as usize]-1, bank, layer);
         } else {
             self.kit_downs[bank as usize] &= !(1 << index);
         }
     }
 
-    fn set_legato(&mut self, value: bool) -> Result<()> {
-        self.legato = value;
-        if !self.legato && self.onset_downs.is_empty() {
-            let msg = self.state_handler.push_onset(ttcore::OnsetInput::Stop);
+    fn set_legato(&mut self, value: bool, layer: u8) -> Result<()> {
+        self.legatos[layer as usize] = value;
+        if !value && self.onset_downs[layer as usize].is_empty() {
+            let msg = self.state_handler.push_onset(ttcore::OnsetInput::Stop, layer);
             self.send(msg)?;
         }
         Ok(())
     }
 
+    fn set_layer(&mut self, layer: u8) {
+        self.onset_downs[self.layer as usize].clear();
+        self.layer = layer;
+    }
+
     fn key_event(&mut self, key: u8, down: bool) -> Result<()> {
-        if self.num_lock {
+        if self.num_locks[0] && key & 3 != 0 {
             match key {
-                4 => self.num_lock = down,
-                5 => if down { self.num_buffer.push_num(0) },
-                6 => if down { self.num_buffer.pop_num() },
-                7 => if down {
-                    let msg = self.state_handler.set_steps_per_meas(self.num_buffer.get_num());
-                    self.send(msg)?;
-                }
-                12 => if down { self.num_buffer.push_num(1) },
-                13 => if down { self.num_buffer.push_num(2) },
-                14 => if down { self.num_buffer.push_num(3) },
-                15 => if down {
-                    let msg = self.state_handler.set_ticks_per_step(self.num_buffer.get_num());
-                    self.send(msg)?;
-                }
-                20 => if down { self.num_buffer.push_num(4) },
-                21 => if down { self.num_buffer.push_num(5) },
-                22 => if down { self.num_buffer.push_num(6) },
-                23 => if down {
-                    let msg = self.state_handler.set_ticks_per_input(self.num_buffer.get_num());
-                    self.send(msg)?;
-                }
-                28 => if down { self.num_buffer.push_num(7) },
-                29 => if down { self.num_buffer.push_num(8) },
-                30 => if down { self.num_buffer.push_num(9) },
-                31 => if down {
-                    let msg = self.state_handler.set_ticks_per_beat(self.num_buffer.get_num());
-                    self.send(msg)?;
-                }
-                36 => if down { self.state_handler.phrase_snap_start = ttcore::state::Snap::Micro },
-                37 => if down { self.state_handler.phrase_snap_start = ttcore::state::Snap::Macro },
-                38 => if down { self.state_handler.phrase_snap_len = ttcore::state::Snap::Micro },
-                39 => if down { self.state_handler.phrase_snap_len = ttcore::state::Snap::Macro },
-                44 => if down { self.state_handler.mod_phrase_start(-(self.num_buffer.get_num() as i32)) },
-                45 => if down { self.state_handler.mod_phrase_start(self.num_buffer.get_num() as i32) },
-                46 => if down { self.state_handler.mod_phrase_len(-(self.num_buffer.get_num() as i32)) },
-                47 => if down { self.state_handler.mod_phrase_len(self.num_buffer.get_num() as i32) },
+                0 => self.num_locks[0] = down,
+                1 => if down { self.num_buffer.push(0) },
+                2 => if down { self.num_buffer.clear() },
+                3 => if down { let msg = self.state_handler.set_steps_per_meas(self.num_buffer.get()); self.send(msg)?; },
+                8 => if down { self.num_buffer.push(1) },
+                9 => if down { self.num_buffer.push(2) },
+                10 => if down { self.num_buffer.push(3) },
+                11 => if down { let msg = self.state_handler.set_ticks_per_step(self.num_buffer.get()); self.send(msg)?; },
+                16 => if down { self.num_buffer.push(4) },
+                17 => if down { self.num_buffer.push(5) },
+                18 => if down { self.num_buffer.push(6) },
+                19 => if down { let msg = self.state_handler.set_ticks_per_input(self.num_buffer.get()); self.send(msg)?; },
+                24 => if down { self.num_buffer.push(7) },
+                25 => if down { self.num_buffer.push(8) },
+                26 => if down { self.num_buffer.push(9) },
+                27 => if down { let msg = self.state_handler.set_ticks_per_beat(self.num_buffer.get()); self.send(msg)?; },
+                32 => if down { self.state_handler.mod_phrase_start(-(self.num_buffer.get() as i32), self.layer) },
+                33 => if down { self.state_handler.mod_phrase_start(self.num_buffer.get() as i32, self.layer) },
+                34 => if down { self.state_handler.mod_phrase_len(-(self.num_buffer.get() as i32), self.layer) },
+                35 => if down { self.state_handler.mod_phrase_len(self.num_buffer.get() as i32, self.layer) },
+                40 => if down { self.state_handler.phrase_snap_start = ttcore::state::Snap::Micro },
+                41 => if down { self.state_handler.phrase_snap_start = ttcore::state::Snap::Macro },
+                42 => if down { self.state_handler.phrase_snap_len = ttcore::state::Snap::Micro },
+                43 => if down { self.state_handler.phrase_snap_len = ttcore::state::Snap::Macro },
+                _ => (),
+            }
+        } else if self.num_locks[1] && key & 3 == 0 {
+            match key {
+                4 => if down { let msg = self.state_handler.set_ticks_per_step(self.num_buffer.get()); self.send(msg)?; },
+                5 => if down { self.num_buffer.clear() },
+                6 => if down { self.num_buffer.push(0) },
+                7 => self.num_locks[1]  = down,
+                12 => if down { let msg = self.state_handler.set_ticks_per_step(self.num_buffer.get()); self.send(msg)?; },
+                13 => if down { self.num_buffer.push(1) },
+                14 => if down { self.num_buffer.push(2) },
+                15 => if down { self.num_buffer.push(3) },
+                20 => if down { let msg = self.state_handler.set_ticks_per_step(self.num_buffer.get()); self.send(msg)?; },
+                21 => if down { self.num_buffer.push(4) },
+                22 => if down { self.num_buffer.push(5) },
+                23 => if down { self.num_buffer.push(6) },
+                28 => if down { let msg = self.state_handler.set_ticks_per_step(self.num_buffer.get()); self.send(msg)?; },
+                29 => if down { self.num_buffer.push(7) },
+                30 => if down { self.num_buffer.push(8) },
+                31 => if down { self.num_buffer.push(9) },
+                36 => if down { self.state_handler.mod_phrase_start(-(self.num_buffer.get() as i32), self.layer) },
+                37 => if down { self.state_handler.mod_phrase_start(self.num_buffer.get() as i32, self.layer) },
+                38 => if down { self.state_handler.mod_phrase_len(-(self.num_buffer.get() as i32), self.layer) },
+                39 => if down { self.state_handler.mod_phrase_len(self.num_buffer.get() as i32, self.layer) },
+                44 => if down { self.state_handler.phrase_snap_start = ttcore::state::Snap::Micro },
+                45 => if down { self.state_handler.phrase_snap_start = ttcore::state::Snap::Macro },
+                46 => if down { self.state_handler.phrase_snap_len = ttcore::state::Snap::Micro },
+                47 => if down { self.state_handler.phrase_snap_len = ttcore::state::Snap::Macro },
                 _ => (),
             }
         } else {
             match key {
-                4 => self.num_lock = down,
-                8 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Micro },
-                9 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Macro },
-                10 => self.push_record(down)?,
-                11 => self.sustain = down,
-                12 => {
-                    let msg = self.state_handler.push_reverse(down);
-                    self.send(msg)?;
-                }
-                13 => if down { self.set_legato(!self.legato)? },
-                14 => if down { self.state_handler.layer = 1 } else { self.state_handler.layer = 0 },
-                15 => if down {
+                0 => self.num_locks[0] = down,
+                1 => if down { self.set_layer(0) },
+                2 => if down { self.set_legato(!self.legatos[0], 0)? },
+                3 => { let msg = self.state_handler.push_reverse(down, 0); self.send(msg)?; },
+                4 => { let msg = self.state_handler.push_reverse(down, 1); self.send(msg)?; },
+                5 => if down { self.set_legato(!self.legatos[1], 1)? },
+                6 => if down { self.set_layer(1) },
+                7 => self.num_locks[1] = down,
+                // 8 => ???
+                // 9 => ???
+                10 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Micro },
+                11 => if down { self.state_handler.ramp_snap = ttcore::state::Snap::Macro },
+                12 => self.push_record(down, self.layer)?,
+                13 => self.sustain = down,
+                14 => if down {
                     self.record_mask = Some(Vec::new());
                 } else if let Some(mask) = self.record_mask.take() {
                     self.state_handler.set_record_mask(&mask);
                 }
-                k if (24..32).contains(&k) => self.push_phrase(k-24, down)?,
-                k if (32..40).contains(&k) => self.push_onset(k-32,down)?,
-                k if (40..44).contains(&k) => self.mult_pitch(k-40,down)?,
-                k if (44..48).contains(&k) => self.ramp_pitch(3-(k-44),down)?,
-                k if (48..52).contains(&k) => self.mult_gain(k-48,down)?,
-                k if (52..56).contains(&k) => self.ramp_gain(3-(k-52),down)?,
-                k if (56..60).contains(&k) => self.push_kit(0,k-56,down),
-                k if (60..64).contains(&k) => self.push_kit(1,k-60,down),
+                // 15 => ???
+                k if (16..24).contains(&k) => self.push_phrase(k - 16, down, self.layer)?,
+                k if (24..32).contains(&k) => self.push_onset(k - 24, down, (self.layer == 0) as u8)?,
+                k if (32..40).contains(&k) => self.push_onset(k - 32, down, self.layer)?,
+                k if (40..44).contains(&k) => self.mult_pitch(k - 40, down, self.layer)?,
+                k if (44..48).contains(&k) => self.ramp_pitch(3 - (k - 44), down, self.layer)?,
+                k if (48..52).contains(&k) => self.mult_gain(k - 48, down, self.layer)?,
+                k if (52..56).contains(&k) => self.ramp_gain(3 - (k - 52), down, self.layer)?,
+                k if (56..60).contains(&k) => self.push_kit(k - 56, down, 0, self.layer),
+                k if (60..64).contains(&k) => self.push_kit(k - 60, down, 1, self.layer),
                 _ => (),
             }
         }
